@@ -1,7 +1,9 @@
-# PNORDE — Dream Sequencer
+﻿# PNORDE — Dream Sequencer
 
 **Free and open-source polyrhythmic / polymetric MIDI sequencing instrument.**  
 **First public alpha: v0.5.2-alpha.1 · Windows x64 VST3**
+
+**[Download the VST3 HERE!](https://github.com/alteredwavestudios/PNORDE/releases/download/v0.5.2-alpha.1/PNORDE-v0.5.2-alpha.1-Windows-x64-VST3.zip)**
 
 **Original concept, creative direction, sequencer architecture and initial programming:** **LANTERNS (Nova O'Reilly)**  
 **Studio:** Altered Wave Studios  
@@ -61,3 +63,4 @@ Bug reports, feature requests and pull requests are welcome. This is an **alpha*
 📷 [Instagram — @alteredwave.media](https://www.instagram.com/alteredwave.media/)
 
 *Vibe Coded By LДNTERNS* 💜
+
