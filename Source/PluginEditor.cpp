@@ -2,7 +2,10 @@
 #include "AudiowideEmbedded.h"
 #include "PnordeLights.h"
 #include "PnordePresetFormat.h"
+#include "PnordePatternLibrary.h"
+#include "PnordeSafeCC.h"
 #include <cmath>
+#include <limits>
 
 namespace
 {
@@ -56,7 +59,7 @@ const juce::String& stepNumberLabel(int zeroBasedIndex)
 }
 
 juce::Rectangle<float> parameterFillBounds(int row, juce::Rectangle<float> outer,
-                                             float proportion)
+                                             float proportion, int optionalType)
 {
     const auto inner = outer.reduced(2.0f);
     const float f = juce::jlimit(0.0f, 1.0f, proportion);
@@ -71,7 +74,7 @@ juce::Rectangle<float> parameterFillBounds(int row, juce::Rectangle<float> outer
             : juce::Rectangle<float>(inner.getX(), mid,
                                      inner.getWidth(), height * 0.5f);
     }
-    if (row == PolyrhythmMIDIProcessor::panRow)
+    if (optionalType == 4)
     {
         const float mid = inner.getCentreX();
         const float x = inner.getX() + inner.getWidth() * f;
@@ -89,28 +92,38 @@ public:
     PnordeSettingsPanel(PolyrhythmMIDIProcessor& p, std::function<void()> changed)
         : processor(p), onChanged(std::move(changed))
     {
-        setSize(408, 550);
+        setSize(408, 735);
+        setOpaque(true);
         for (int i = 0; i < themeCount; ++i) theme.addItem(themes[i].name, i + 1);
         for (int i = 1; i <= 16; ++i)
             channel.addItem("Channel " + juce::String(i), i);
-        const char* ranges[] { "±2 semitones", "±12 semitones",
-                                "±24 semitones", "±48 semitones" };
+        const char* ranges[] { "+/-2 semitones", "+/-12 semitones",
+                                "+/-24 semitones", "+/-48 semitones" };
         for (int i = 0; i < 4; ++i) bend.addItem(ranges[i], i + 1);
         theme.setSelectedId(processor.getThemeIndex() + 1, juce::dontSendNotification);
         channel.setSelectedId(processor.getDefaultMidiChannel(), juce::dontSendNotification);
-        bend.setSelectedId(processor.getBendRangeIndex() + 1, juce::dontSendNotification);
+        bend.setSelectedId(processor.getEffectiveBendRangeIndex() + 1, juce::dontSendNotification);
+        bend.setEnabled(!processor.isMicrotonalScaleSelected());
+        bend.setTooltip("Microtonal scales automatically use +/-2 semitones. Match your receiving synth; standard scales restore your saved preference.");
         theme.onChange = [this]
         {
             processor.setThemeIndex(theme.getSelectedId() - 1);
+            applyPalette();
             repaint(); if (onChanged) onChanged();
         };
         channel.onChange = [this]
         { processor.setDefaultMidiChannel(channel.getSelectedId()); };
         bend.onChange = [this]
-        { processor.setBendRangeIndex(bend.getSelectedId() - 1); };
+        {
+            if (!processor.isMicrotonalScaleSelected())
+                processor.setBendRangeIndex(bend.getSelectedId() - 1);
+            else
+                bend.setSelectedId(1, juce::dontSendNotification);
+        };
         for (auto* combo : { &theme, &channel, &bend }) addAndMakeVisible(*combo);
+        applyPalette();
 
-        animations.setButtonText("LED animations and clock flashes");
+        animations.setButtonText("Smooth playhead and marker animations");
         fades.setButtonText("Fading scroll edges");
         tooltips.setButtonText("Parameter tooltips");
         animations.setToggleState(processor.getAnimationsEnabled(), juce::dontSendNotification);
@@ -123,6 +136,45 @@ public:
         tooltips.onClick = [this]
         { processor.setTooltipsEnabled(tooltips.getToggleState()); if (onChanged) onChanged(); };
         for (auto* toggle : { &animations, &fades, &tooltips }) addAndMakeVisible(*toggle);
+        reorder.setButtonText("EXPERIMENTAL: Drag coloured lane rails to reorder");
+        reorder.setToggleState(processor.getExperimentalReorderEnabled(), juce::dontSendNotification);
+        reorder.onClick = [this] { processor.setExperimentalReorderEnabled(reorder.getToggleState()); };
+        addAndMakeVisible(reorder);
+
+        microMode.addItem("Standard bend: +/-2; SLIDE = pitch approach", 1);
+        microMode.addItem("EXPERIMENTAL MPE: +/-2; member channel 2", 2);
+        // Older mode 2 is an alias for standard; do not expose a duplicate.
+        microMode.setSelectedId(processor.getMicroOutputMode() == 1 ? 2 : 1,
+                                juce::dontSendNotification);
+        microMode.onChange = [this]
+        {
+            processor.setMicroOutputMode(microMode.getSelectedId()-1);
+            processor.requestMidiPanic();
+            if (onChanged) onChanged();
+        };
+        addAndMakeVisible(microMode);
+        mpePoly.setButtonText("EXPERIMENTAL: Poly Aftertouch (independent)");
+        mpePoly.setToggleState(processor.getExperimentalPolyPressure(), juce::dontSendNotification);
+        mpePoly.onClick = [this]
+        { processor.setExperimentalPolyPressure(mpePoly.getToggleState()); };
+        addAndMakeVisible(mpePoly);
+        diagnostics.setJustificationType(juce::Justification::centredLeft);
+        diagnostics.setFont(font(11.0f));
+        addAndMakeVisible(diagnostics);
+        refreshDiagnostics.setButtonText("Refresh MIDI Diagnostics");
+        refreshDiagnostics.setTooltip("Displays PNORDE-generated pitch bends, not what Ableton delivers.");
+        refreshDiagnostics.onClick = [this] { updateDiagnostics(); };
+        addAndMakeVisible(refreshDiagnostics);
+        updateDiagnostics();
+        experimental.setButtonText("EXPERIMENTAL: Sequencer lighting + darkness");
+        experimental.setToggleState(processor.getExperimentalLightsEnabled(), juce::dontSendNotification);
+        experimental.onClick = [this]
+        {
+            processor.setExperimentalLightsEnabled(experimental.getToggleState());
+            darkness.setEnabled(experimental.getToggleState());
+            if (onChanged) onChanged();
+        };
+        addAndMakeVisible(experimental);
 
         darkness.setSliderStyle(juce::Slider::LinearHorizontal);
         darkness.setTextBoxStyle(juce::Slider::TextBoxRight, false, 42, 22);
@@ -133,8 +185,9 @@ public:
         { processor.setDarknessPercent(juce::roundToInt(darkness.getValue()));
           if (onChanged) onChanged(); };
         addAndMakeVisible(darkness);
+        darkness.setEnabled(processor.getExperimentalLightsEnabled());
 
-        panic.setButtonText("MIDI PANIC   •   All Notes Off");
+        panic.setButtonText("MIDI PANIC - All Notes Off");
         panic.onClick = [this] { processor.requestMidiPanic(); };
         addAndMakeVisible(panic);
     }
@@ -153,15 +206,17 @@ public:
                    juce::Justification::centredLeft);
         g.drawText("Pitch bend range", 20, 191, 230, 18,
                    juce::Justification::centredLeft);
-        g.drawText("DARKNESS  /  lights remain illuminated", 20, 249, 350, 18,
+        g.drawText("DARKNESS  /  experimental only", 20, 249, 350, 18,
                    juce::Justification::centredLeft);
         g.setColour(p.ink.withAlpha(0.18f));
         g.drawHorizontalLine(320, 18.0f, static_cast<float>(getWidth() - 18));
-        g.drawHorizontalLine(476, 18.0f, static_cast<float>(getWidth() - 18));
+        g.drawHorizontalLine(652, 18.0f, static_cast<float>(getWidth() - 18));
+        g.drawText("Microtonal MIDI output", 20, 476, 330, 18,
+                   juce::Justification::centredLeft);
         g.setColour(p.ink.withAlpha(0.70f));
-        g.drawText("PNORDE – Dream Sequencer   v0.5.2", 18, 493,
+        g.drawText("PNORDE - Dream Sequencer   v0.5.9 Candidate", 18, 672,
                    getWidth() - 36, 17, juce::Justification::centredLeft);
-        g.drawText("Altered Wave Studios", 18, 514,
+        g.drawText("Altered Wave Studios", 18, 693,
                    getWidth() - 36, 17, juce::Justification::centredLeft);
     }
     void resized() override
@@ -171,16 +226,60 @@ public:
         channel.setBounds(20, 153, w, 28);
         bend.setBounds(20, 211, w, 28);
         darkness.setBounds(20, 271, w, 32);
-        animations.setBounds(20, 332, w, 26);
-        fades.setBounds(20, 361, w, 26);
-        tooltips.setBounds(20, 390, w, 26);
-        panic.setBounds(20, 434, w, 27);
+        experimental.setBounds(20, 315, w, 26);
+        animations.setBounds(20, 352, w, 26);
+        fades.setBounds(20, 382, w, 26);
+        tooltips.setBounds(20, 412, w, 26);
+        reorder.setBounds(20, 442, w, 26);
+        microMode.setBounds(20, 498, w, 27);
+        mpePoly.setBounds(20, 530, w, 27);
+        diagnostics.setBounds(20, 565, w, 19);
+        refreshDiagnostics.setBounds(20, 589, w, 23);
+        panic.setBounds(20, 621, w, 27);
     }
 private:
+    void applyPalette()
+    {
+        const auto& p = themes[juce::jlimit(0, themeCount - 1, processor.getThemeIndex())];
+        for (auto* combo : { &theme, &channel, &bend, &microMode })
+        {
+            combo->setColour(juce::ComboBox::backgroundColourId, p.cream);
+            combo->setColour(juce::ComboBox::textColourId, p.ink);
+            combo->setColour(juce::ComboBox::arrowColourId, p.ink);
+            combo->setColour(juce::ComboBox::outlineColourId, p.teal);
+        }
+        for (auto* toggle : { &animations, &fades, &tooltips, &experimental, &reorder, &mpePoly })
+        {
+            toggle->setColour(juce::ToggleButton::textColourId, p.ink);
+            toggle->setColour(juce::ToggleButton::tickColourId,
+                p.paper.getPerceivedBrightness() > 0.55f ? juce::Colours::black : p.ink);
+            toggle->setColour(juce::ToggleButton::tickDisabledColourId, p.ink.withAlpha(0.5f));
+        }
+        darkness.setColour(juce::Slider::textBoxTextColourId, p.ink);
+        darkness.setColour(juce::Slider::textBoxBackgroundColourId, p.cream);
+        darkness.setColour(juce::Slider::textBoxOutlineColourId, p.middle);
+        darkness.setColour(juce::Slider::thumbColourId, p.teal);
+        darkness.setColour(juce::Slider::trackColourId, p.teal);
+        diagnostics.setColour(juce::Label::textColourId, p.ink);
+        refreshDiagnostics.setColour(juce::TextButton::buttonColourId, p.cream);
+        refreshDiagnostics.setColour(juce::TextButton::textColourOffId, p.ink);
+        panic.setColour(juce::TextButton::buttonColourId, p.cream);
+        panic.setColour(juce::TextButton::textColourOffId, p.ink);
+    }
+    void updateDiagnostics()
+    {
+        const int bend = processor.getLastPitchWheelValue();
+        diagnostics.setText("Bend=" + juce::String(bend) +
+            "  EDO offset=" + juce::String(processor.getLastEDOOffsetCents()) +
+            "c  Messages=" + juce::String(processor.getPitchWheelSendCount()),
+            juce::dontSendNotification);
+    }
     PolyrhythmMIDIProcessor& processor;
     std::function<void()> onChanged;
-    juce::ComboBox theme, channel, bend;
-    juce::ToggleButton animations, fades, tooltips;
+    juce::ComboBox theme, channel, bend, microMode;
+    juce::ToggleButton animations, fades, tooltips, experimental, reorder, mpePoly;
+    juce::Label diagnostics;
+    juce::TextButton refreshDiagnostics;
     juce::Slider darkness;
     juce::TextButton panic;
 };
@@ -202,21 +301,29 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
     scrollContent.setInterceptsMouseClicks(false, true);
 
     const char* keys[] {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-    const char* scales[] {"Chromatic", "Major", "Minor", "Dorian", "Phrygian", "Locrian", "Blues", "Major Blues", "Bebop", "Harmonic Minor", "Pelog", "Melodic Minor", "Mixolydian", "Free (0.1)"};
-    for (int i = 0; i < 12; ++i) keySelect.addItem(keys[i], i + 1);
-    for (int i = 0; i < 14; ++i) scaleSelect.addItem(scales[i], i + 1);
+    for (int i = 0; i < PnordeScales::count; ++i)
+        scaleSelect.addItem(PnordeScales::names[i], i + 1);
     for (auto* box : { &keySelect, &scaleSelect })
     {
         box->setColour(juce::ComboBox::backgroundColourId, paper);
         box->setColour(juce::ComboBox::textColourId, ink);
-        addAndMakeVisible(*box);
+        // These legacy ComboBoxes synchronise parameter values but are hidden;
+        // the rotary dials are the actual mouse-accessible controls.
     }
     keySelect.setSelectedId(processor.getKey() + 1, juce::dontSendNotification);
     scaleSelect.setSelectedId(processor.getScale() + 1, juce::dontSendNotification);
-    keySelect.onChange = [this] { processor.setKey(keySelect.getSelectedId() - 1); repaint(); };
+    keySelect.onChange = [this]
+    {
+        const int id = keySelect.getSelectedId();
+        if (id < 1 || id > 12) return;
+        processor.setKey(id - 1);
+        repaint();
+    };
     scaleSelect.onChange = [this]
     {
-        processor.setScale(scaleSelect.getSelectedId() - 1);
+        const int id = scaleSelect.getSelectedId();
+        if (id < 1 || id > PnordeScales::count) return;
+        processor.setScale(id - 1);
         if (processor.getScale() != 13)
             for (int i = 0; i < 128; ++i)
                 processor.setLaneValue(1, i, processor.quantizePitchTenths(processor.getLaneValue(1, i), 0));
@@ -230,44 +337,154 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
     {
         box->setColour(juce::ComboBox::backgroundColourId, paper);
         box->setColour(juce::ComboBox::textColourId, ink);
-        addAndMakeVisible(*box);
+        // Replaced by compact rotary dials for Global Clock.
     }
+    addAndMakeVisible(bendRangeSelect);
     globalClockSelect.setSelectedId(processor.getGlobalClockIndex() + 1, juce::dontSendNotification);
-    bendRangeSelect.setSelectedId(processor.getBendRangeIndex() + 1, juce::dontSendNotification);
+    bendRangeSelect.setSelectedId(processor.getEffectiveBendRangeIndex() + 1, juce::dontSendNotification);
+    bendRangeSelect.setEnabled(!processor.isMicrotonalScaleSelected());
     globalClockSelect.onChange = [this] { processor.setGlobalClockIndex(globalClockSelect.getSelectedId() - 1); };
     globalClockSelect.onReset = [this]
     {
         globalClockSelect.setSelectedId(3, juce::sendNotificationSync); // 1x
     };
-    bendRangeSelect.onChange = [this] { processor.setBendRangeIndex(bendRangeSelect.getSelectedId() - 1); };
-    // Only modulation-oriented, non-channel-mode CCs are offered here.
-    for (int slot = 0; slot < 8; ++slot)
+    bendRangeSelect.onChange = [this]
     {
+        if (!processor.isMicrotonalScaleSelected())
+            processor.setBendRangeIndex(bendRangeSelect.getSelectedId() - 1);
+        else
+            bendRangeSelect.setSelectedId(1, juce::dontSendNotification);
+    };
+    // Dedicated, discrete top-bar dials. All bounds are set in resized().
+    octaveDial.setChoices(juce::StringArray {"-2", "-1", "0", "+1", "+2"},
+                         processor.getGlobalOctave() + 2);
+    octaveDial.setDescription("GLOBAL OCTAVE: transpose notes within MIDI 0-127");
+    octaveDial.onChange = [this](int idx) { processor.setGlobalOctave(idx-2); repaint(); };
+    addAndMakeVisible(octaveDial);
+    keyDial.setChoices(juce::StringArray {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}, processor.getKey());
+    keyDial.setDescription("KEY");
+    keyDial.onChange = [this](int idx) { processor.setKey(idx); repaint(); };
+    addAndMakeVisible(keyDial);
+    juce::StringArray allScales;
+    for (int i = 0; i < PnordeScales::count; ++i)
+        allScales.add(PnordeScales::names[i]);
+    scaleDial.setChoices(allScales, processor.getScale());
+    scaleDial.setDescription("SCALE");
+    scaleDial.onChange = [this](int idx)
+    {
+        processor.setScale(idx);
+        bendRangeSelect.setSelectedId(processor.getEffectiveBendRangeIndex() + 1,
+                                      juce::dontSendNotification);
+        bendRangeSelect.setEnabled(!processor.isMicrotonalScaleSelected());
+        if (idx != 13)
+            for (int step=0; step<128; ++step)
+                processor.setLaneValue(1, step,
+                    processor.quantizePitchTenths(processor.getLaneValue(1,step),0));
+        repaint();
+    };
+    addAndMakeVisible(scaleDial);
+    globalClockDial.setChoices(juce::StringArray {"1/4x","1/2x","1x","2x","4x"}, processor.getGlobalClockIndex());
+    globalClockDial.setDescription("GLOBAL CLOCK");
+    globalClockDial.onChange = [this](int idx) { processor.setGlobalClockIndex(idx); repaint(); };
+    addAndMakeVisible(globalClockDial);
+    manualTempoToggle.setToggleState(processor.getManualTempoEnabled(), juce::dontSendNotification);
+    manualTempoToggle.setTooltip("Override Ableton BPM while following its transport start/stop and seek.");
+    manualTempoToggle.onClick = [this] {
+        processor.setManualTempoEnabled(manualTempoToggle.getToggleState());
+        manualTempoInput.setEnabled(manualTempoToggle.getToggleState());
+    };
+    addAndMakeVisible(manualTempoToggle);
+    manualTempoInput.setInputRestrictions(6, "0123456789.");
+    manualTempoInput.setText(juce::String(processor.getManualTempoBpm(), 1), false);
+    manualTempoInput.setTooltip("Manual tempo in BPM (20.0 to 300.0). Enter to apply.");
+    manualTempoInput.onReturnKey = [this] {
+        processor.setManualTempoBpm(manualTempoInput.getText().getDoubleValue());
+        manualTempoInput.setText(juce::String(processor.getManualTempoBpm(), 1), false);
+        manualTempoInput.giveAwayKeyboardFocus();
+    };
+    manualTempoInput.onFocusLost = [this] {
+        manualTempoInput.setText(juce::String(processor.getManualTempoBpm(), 1), false);
+    };
+    manualTempoInput.setEnabled(processor.getManualTempoEnabled());
+    addAndMakeVisible(manualTempoInput);
+    // Only modulation-oriented, non-channel-mode CCs are offered here.
+    for (int slot = 0; slot < optionalLanes; ++slot)
+    {
+        auto& laneType = laneTypeSelect[slot];
+        laneType.addItem("CC MACRO", 1);
+        // Macro CC numbers are chosen ONLY with ccSelect, not this type menu.
+        laneType.addSeparator();
+        laneType.addItem("MOD WHEEL", 2);
+        laneType.addItem("EXPRESSION PEDAL", 3);
+        laneType.addItem("VIBRATO", 4);
+        laneType.addItem("PAN", 5);
+        laneType.addItem("SUSTAIN PEDAL", 6);
+        laneType.addItem("MIDI CHANNEL SELECT", 7);
+        laneType.setSelectedId(processor.getOptionalLaneType(slot + 7) + 1, juce::dontSendNotification);
+        laneType.onChange = [this, slot]
+        {
+            const int row = slot + 7;
+            const int selected = laneTypeSelect[slot].getSelectedId();
+            if (selected < 1 || selected > 7) return;
+            const int desired = selected - 1;
+            if (!processor.setOptionalLaneType(row, desired))
+            {
+                laneTypeSelect[slot].setSelectedId(processor.getOptionalLaneType(row) + 1,
+                                                   juce::dontSendNotification);
+                juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                    "PNORDE lane type", "Each fixed parameter can be used only once, and there can be at most eight CC Macros.");
+                return;
+            }
+            laneTypeSelect[slot].setSelectedId(desired + 1, juce::dontSendNotification);
+            // Reuse existing vertical values; discard vibrato's horizontal
+            // depth when changing role. The processor enforces uniqueness.
+            for (int step = 0; step < 128; ++step)
+            {
+                auto& l = lane[row];
+                l.values[step] = processor.getLaneValue(row, step);
+                l.visualFill[step] = desired == 6 ? l.values[step] / 16.0f :
+                    desired == 4 ? l.values[step] / 127.0f : l.values[step] / 100.0f;
+            }
+            if (ccPopupRow == row) { ccPopupRow = -1; ccPopupAlpha = 0.0f; }
+            syncCCVisibility(); resized(); repaint();
+        };
+        laneType.setColour(juce::ComboBox::backgroundColourId, paper);
+        laneType.setColour(juce::ComboBox::textColourId, ink);
+        scrollContent.addAndMakeVisible(laneType);
         auto& select = ccSelect[slot];
-        for (int cc = 2; cc <= 119; ++cc)
-            if (cc != 6 && cc != 10 && cc != 11 && cc != 32 && cc != 38 &&
-                cc != 64 && cc != 76 && cc != 77 && cc != 98 && cc != 99 &&
-                cc != 100 && cc != 101)
-                select.addItem("CC " + juce::String(cc), cc + 1);
+        // Deliberately conservative: the macro range is CC20..31 only.
+        // CC0/32 bank selection, 6/38 data entry, 98..101 NRPN/RPN,
+        // 120..127 channel mode and fixed PNORDE CCs cannot be selected.
+        for (int cc = PnordeSafeCC::first; cc <= PnordeSafeCC::last; ++cc)
+            select.addItem("CC " + juce::String(cc), cc + 1);
         select.setSelectedId(processor.getCustomCCNumber(slot) + 1, juce::dontSendNotification);
-        select.onChange = [this, slot] { processor.setCustomCCNumber(slot, ccSelect[slot].getSelectedId() - 1); };
+        select.onChange = [this, slot]
+        {
+            const int selectedCC = ccSelect[slot].getSelectedId() - 1;
+            if (PnordeSafeCC::allowed(selectedCC))
+                processor.setCustomCCNumber(slot, selectedCC);
+        };
         select.setColour(juce::ComboBox::backgroundColourId, paper);
         select.setColour(juce::ComboBox::textColourId, ink);
         scrollContent.addAndMakeVisible(select);
         auto& labelEditor = ccLabelEditors[slot];
-        labelEditor.setTextToShowWhenEmpty("MACRO " + juce::String(slot + 1), ink.withAlpha(0.88f));
+        // Updated by refreshMacroPlaceholders() using the visible Macro ordinal.
+        labelEditor.setTextToShowWhenEmpty("MACRO", ink.withAlpha(0.88f));
         labelEditor.setText(processor.getCustomCCLabel(slot), false);
         committedCCLabels[slot] = processor.getCustomCCLabel(slot);
         labelEditor.setInputRestrictions(12);
-        labelEditor.setColour(juce::TextEditor::backgroundColourId, juce::Colours::transparentBlack);
+        labelEditor.setColour(juce::TextEditor::backgroundColourId, paper);
+        labelEditor.setOpaque(true); // Never show a painted label underneath.
         labelEditor.setColour(juce::TextEditor::textColourId, juce::Colours::black);
         labelEditor.setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
         labelEditor.setColour(juce::TextEditor::highlightedTextColourId, juce::Colours::black);
         labelEditor.setColour(juce::TextEditor::focusedOutlineColourId, teal);
         labelEditor.setFont(font(getHeight() * 0.0185f, true));
-        labelEditor.setJustification(juce::Justification::centredLeft);
+        labelEditor.setJustification(juce::Justification::centred);
         labelEditor.setSelectAllWhenFocused(true);
-        labelEditor.setTooltip("Click to rename this custom CC lane");
+        labelEditor.setTooltip("Click to rename this CC Macro. Press Enter to save, Escape to cancel.");
+        // Do not forward TextEditor clicks into the lane drag handler.
+        // The coloured rail has its own dedicated hit target.
         // Only Return commits. Clicking elsewhere discards uncommitted edits.
         labelEditor.onReturnKey = [this, slot]
         {
@@ -290,15 +507,15 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
         scrollContent.addAndMakeVisible(labelEditor);
 
         deleteCC[slot].setButtonText("X");
+        deleteCC[slot].setTooltip("Remove this optional lane");
         deleteCC[slot].onClick = [this, slot]
         {
-            processor.removeCustomCC(slot);
-            for (int i = 0; i < 8; ++i)
+            processor.removeOptionalLane(slot + 7);
+            ccPopupRow = -1; ccPopupAlpha = 0.0f;
+            for (int i = 0; i < optionalLanes; ++i)
             {
+                laneTypeSelect[i].setSelectedId(processor.getOptionalLaneType(i + 7) + 1, juce::dontSendNotification);
                 ccSelect[i].setSelectedId(processor.getCustomCCNumber(i) + 1, juce::dontSendNotification);
-            }
-            for (int i = 0; i < 8; ++i)
-            {
                 committedCCLabels[i] = processor.getCustomCCLabel(i);
                 ccLabelEditors[i].setText(committedCCLabels[i], false);
             }
@@ -315,45 +532,32 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
     addCCButton.onClick = [this]
     {
         juce::PopupMenu menu;
-        menu.addItem(1, "CC Macro (Macro " + juce::String(processor.getCustomCCCount() + 1) + ")",
-            processor.getCustomCCCount() < 8);
-        menu.addSeparator();
-        const char* dedicated[] { "Mod Wheel (CC1)", "Expression Pedal (CC11)",
-            "Vibrato - Rate CC76 + Depth CC77", "Pan (CC10)", "Sustain Pedal (CC64)" };
-        for (int i = 0; i < 5; ++i)
-            menu.addItem(i + 2, dedicated[i], !processor.isDedicatedEnabled(modRow + i));
-        menu.addItem(7, "MIDI Channel Select", !processor.hasMidiChannelLane());
+        const char* types[] { "CC MACRO", "MOD WHEEL", "EXPRESSION PEDAL",
+                              "VIBRATO", "PAN", "SUSTAIN PEDAL", "MIDI CHANNEL SELECT" };
+        for (int kind = 0; kind < 7; ++kind)
+        {
+            const bool permitted = kind == 0
+                ? processor.activeCCMacroCount() < 8
+                : !processor.hasActiveLaneType(kind);
+            menu.addItem(kind + 1, types[kind], permitted);
+        }
         auto safe = juce::Component::SafePointer<PolyrhythmMIDIEditor>(this);
         menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&addCCButton),
             [safe](int id)
             {
-                if (safe == nullptr || id <= 0) return;
-                if (id == 1) safe->addMacroOfType(0);
-                else if (id == 7) safe->processor.setMidiChannelLaneEnabled(true);
-                else safe->processor.setDedicatedEnabled(modRow + id - 2, true);
+                if (safe == nullptr || id < 1 || id > 7) return;
+                const int row = safe->processor.addOptionalLane(id - 1);
+                if (row < 0) return;
+                const int slot = row - 7;
+                if (id == 1) safe->processor.setCustomCCLabel(slot, {});
+                safe->laneTypeSelect[slot].setSelectedId(id, juce::dontSendNotification);
+                safe->committedCCLabels[slot] = safe->processor.getCustomCCLabel(slot);
+                safe->ccLabelEditors[slot].setText(safe->committedCCLabels[slot], false);
                 safe->syncCCVisibility();
                 safe->targetScrollY = safe->maxScroll();
                 safe->resized(); safe->repaint();
             });
     };
-    deleteChannelButton.onClick = [this]
-    {
-        processor.setMidiChannelLaneEnabled(false);
-        syncCCVisibility();
-        targetScrollY = juce::jmin(targetScrollY, maxScroll());
-        resized(); repaint();
-    };
-    for (int i = 0; i < 5; ++i)
-    {
-        deleteDedicated[i].setButtonText("X");
-        deleteDedicated[i].onClick = [this, i]
-        {
-            processor.setDedicatedEnabled(modRow + i, false);
-            targetScrollY = juce::jmin(targetScrollY, maxScroll());
-            syncCCVisibility(); resized(); repaint();
-        };
-        scrollContent.addAndMakeVisible(deleteDedicated[i]);
-    }
     settingsButton.onClick = [this] { showSettingsMenu(); };
     addAndMakeVisible(settingsButton);
     darknessSlider.setSliderStyle(juce::Slider::LinearHorizontal);
@@ -367,7 +571,7 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
         processor.setDarknessPercent(juce::roundToInt(darknessSlider.getValue()));
         repaint();
     };
-    addAndMakeVisible(darknessSlider);
+    addChildComponent(darknessSlider); // Experimental darkness is controlled in Settings.
     initialisePresetDirectory();
     presetFolderButton.onClick = [this] { showPresetFolderMenu(); };
     presetFolderButton.setTooltip("Open, choose, or reset the PNORDE preset folder");
@@ -378,7 +582,7 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
     for (auto* control : { &savePresetButton, &loadPresetButton, &randomiseButton })
         addAndMakeVisible(*control);
 
-    scrollContent.addAndMakeVisible(deleteChannelButton);
+
     addCCButton.setColour(juce::TextButton::buttonColourId, teal);
     addCCButton.setColour(juce::TextButton::textColourOffId, ink);
     addAndMakeVisible(addCCButton);
@@ -396,10 +600,10 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
         {
             processor.setLaneTiming(row, timings[static_cast<size_t>(row)].getSelectedId() - 1);
         };
-        scrollContent.addAndMakeVisible(timing);
+        // Clock dial replaces timing + division ComboBoxes in the work area.
         for (int i = 0; i < 128; ++i)
             l.values[static_cast<size_t>(i)] = processor.getLaneValue(row, i);
-        for (int i = 0; i < 128; ++i) l.visualFill[i] = row == channelRow ? l.values[i] / 16.0f : row == panRow ? l.values[i] / 127.0f : row == 1 || row == 4 ? 0.5f : row == 5 || row == 6 ? 0.0f : l.values[i] / 100.0f;
+        for (int i = 0; i < 128; ++i) l.visualFill[i] = isLaneType(row, PnordeLane::Type::midiChannel) ? l.values[i] / 16.0f : isLaneType(row, PnordeLane::Type::pan) ? l.values[i] / 127.0f : row == 1 || row == 4 ? 0.5f : row == 5 || row == 6 ? 0.0f : l.values[i] / 100.0f;
         for (int i = 0; i < 11; ++i)
             divisions[static_cast<size_t>(row)].addItem(divisionsText[i], i + 1);
         auto& box = divisions[static_cast<size_t>(row)];
@@ -420,7 +624,25 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
         {
             divisions[row].setSelectedId(3, juce::sendNotificationSync); // 1/8 default
         };
-        scrollContent.addAndMakeVisible(box);
+        auto& dial = clockDials[static_cast<size_t>(row)];
+        dial.setValue(l.division);
+        dial.onChange = [this, row](int divisionIndex)
+        {
+            processor.setLaneDivision(row, divisionIndex);
+            lane[row].division = divisionIndex;
+            divisions[row].setSelectedId(divisionIndex+1, juce::dontSendNotification);
+            repaint();
+        };
+        scrollContent.addAndMakeVisible(dial);
+        auto& timingDial = timingDials[static_cast<size_t>(row)];
+        timingDial.setValue(processor.getLaneTiming(row));
+        timingDial.onChange = [this, row](int mode)
+        {
+            processor.setLaneTiming(row, mode);
+            timings[row].setSelectedId(mode+1, juce::dontSendNotification);
+            repaint();
+        };
+        scrollContent.addAndMakeVisible(timingDial);
         auto& left = prev[static_cast<size_t>(row)];
         auto& right = next[static_cast<size_t>(row)];
         left.setButtonText("<"); right.setButtonText(">");
@@ -485,30 +707,36 @@ PolyrhythmMIDIEditor::PolyrhythmMIDIEditor(PolyrhythmMIDIProcessor& p)
             midiOutputSelect.setSelectedId(1, juce::dontSendNotification);
         }
     };
-    refreshMidiOutputs.setButtonText("↻");
+    refreshMidiOutputs.setButtonText("R");
     refreshMidiOutputs.onClick = [this] { refreshMidiOutputMenu(); };
     addAndMakeVisible(refreshMidiOutputs);
     refreshMidiOutputMenu();
-    addAndMakeVisible(themeSelect);
+    // Theme selection remains in Settings; the header has no theme ComboBox.
     applyTheme();
     applyTooltips();
     syncCCVisibility();
     updateButtons();
-    startTimerHz(45); // Scoped redraws preserve smooth LED motion; MIDI stays sample-accurate.
+    animationTimerHz = processor.getExperimentalLightsEnabled() ? 30 : 24;
+    startTimerHz(animationTimerHz); // Fast effects opt-in; MIDI timing unaffected.
 }
 
 bool PolyrhythmMIDIEditor::rowVisible(int row) const noexcept
 {
     if (row < 0 || row >= lanes) return false;
     if (row < 7) return true;
-    if (row < modRow) return row - 7 < processor.getCustomCCCount();
-    if (row < channelRow) return processor.isDedicatedEnabled(row);
-    return processor.hasMidiChannelLane();
+    return processor.isOptionalLaneEnabled(row);
 }
 int PolyrhythmMIDIEditor::visibleIndex(int row) const noexcept
 {
     int index = 0;
-    for (int r = 0; r < row; ++r) if (rowVisible(r)) ++index;
+    if (row < 7) return row;
+    index = 7;
+    for (int i = 0; i < optionalLanes; ++i)
+    {
+        const int displayedRow = processor.getDisplayRowAt(i);
+        if (displayedRow == row) return index;
+        if (rowVisible(displayedRow)) ++index;
+    }
     return index;
 }
 int PolyrhythmMIDIEditor::visibleRowCount() const noexcept
@@ -517,6 +745,26 @@ int PolyrhythmMIDIEditor::visibleRowCount() const noexcept
     for (int r = 0; r < lanes; ++r) if (rowVisible(r)) ++count;
     return count;
 }
+juce::String PolyrhythmMIDIEditor::laneDisplayName(int row) const
+{
+    if (row < 0 || row >= lanes) return {};
+    if (row < 7) return names[row];
+    if (isLaneType(row, PnordeLane::Type::ccMacro))
+    {
+        const auto label = processor.getCustomCCLabel(row - 7).trim();
+        if (label.isNotEmpty()) return label;
+        int ordinal = 0;
+        for (int i = 0; i < optionalLanes; ++i)
+        {
+            const int r = processor.getDisplayRowAt(i);
+            if (processor.isOptionalLaneEnabled(r) && isLaneType(r, PnordeLane::Type::ccMacro)) ++ordinal;
+            if (r == row) break;
+        }
+        return "MACRO " + juce::String(juce::jmax(1, ordinal));
+    }
+    return PnordeLane::label(static_cast<PnordeLane::Type>(processor.getOptionalLaneType(row)));
+}
+
 float PolyrhythmMIDIEditor::rowTop(int row) const
 {
     return getHeight() * (0.155f + visibleIndex(row) * 0.110f) - scrollY;
@@ -535,6 +783,15 @@ juce::Rectangle<float> PolyrhythmMIDIEditor::lengthBox(int row) const
 {
     return {getWidth() * 0.069f, rowTop(row) + getHeight() * 0.049f,
             getWidth() * 0.090f, getHeight() * 0.034f};
+}
+
+juce::Rectangle<float> PolyrhythmMIDIEditor::reorderHandle(int row) const
+{
+    // The visible rail is 4 px wide at x = 0.055 * width.
+    // This much larger hit target ends before the Macro text editor at 0.068.
+    // Delete buttons end at 0.046, so neither interaction overlaps.
+    return {getWidth() * 0.048f, rowTop(row) - getHeight() * 0.011f,
+            getWidth() * 0.018f, getHeight() * 0.097f};
 }
 float PolyrhythmMIDIEditor::markerXFor(int row, int length) const
 {
@@ -584,14 +841,25 @@ void PolyrhythmMIDIEditor::resized()
         box.setBounds(juce::roundToInt(w * x), juce::roundToInt(h * 0.057f),
                       juce::roundToInt(w * width), juce::roundToInt(h * 0.034f));
     };
-    midiOutputSelect.setBounds(juce::roundToInt(w * 0.239f), juce::roundToInt(h * 0.057f),
-                               juce::roundToInt(w * 0.098f), juce::roundToInt(h * 0.034f));
-    refreshMidiOutputs.setBounds(juce::roundToInt(w * 0.341f), juce::roundToInt(h * 0.057f),
-                                 juce::roundToInt(w * 0.020f), juce::roundToInt(h * 0.034f));
-    place(keySelect, 0.365f, 0.060f);
-    place(scaleSelect, 0.433f, 0.140f);
-    place(globalClockSelect, 0.581f, 0.080f);
+    // Footer left bay, clear of SAVE PRESET starting at 0.285.
+    midiOutputSelect.setBounds(juce::roundToInt(w * 0.061f), juce::roundToInt(h * 0.943f),
+                               juce::roundToInt(w * 0.166f), juce::roundToInt(h * 0.031f));
+    refreshMidiOutputs.setBounds(juce::roundToInt(w * 0.231f), juce::roundToInt(h * 0.943f),
+                                 juce::roundToInt(w * 0.039f), juce::roundToInt(h * 0.031f));
+    const auto setDial = [w,h](PnordeChoiceDial& d, float x, float width)
+    {
+        d.setBounds(juce::roundToInt(w*x), juce::roundToInt(h*0.051f),
+                    juce::roundToInt(w*width), juce::roundToInt(h*0.047f));
+    };
+    setDial(octaveDial, 0.249f, 0.097f);
+    setDial(keyDial, 0.360f, 0.075f);
+    setDial(scaleDial, 0.440f, 0.137f);
+    setDial(globalClockDial, 0.584f, 0.078f);
     place(bendRangeSelect, 0.669f, 0.080f);
+    manualTempoToggle.setBounds(juce::roundToInt(w*0.750f), juce::roundToInt(h*0.057f),
+                                juce::roundToInt(w*0.066f), juce::roundToInt(h*0.033f));
+    manualTempoInput.setBounds(juce::roundToInt(w*0.820f), juce::roundToInt(h*0.058f),
+                               juce::roundToInt(w*0.061f), juce::roundToInt(h*0.031f));
     addCCButton.setBounds(juce::roundToInt(w * 0.885f), juce::roundToInt(h * 0.057f),
                           juce::roundToInt(w * 0.099f), juce::roundToInt(h * 0.034f));
     settingsButton.setBounds(juce::roundToInt(w * 0.956f), juce::roundToInt(h * 0.944f),
@@ -606,19 +874,21 @@ void PolyrhythmMIDIEditor::resized()
         juce::roundToInt(w * 0.101f), juce::roundToInt(h * 0.031f));
     presetFolderButton.setBounds(juce::roundToInt(w * 0.597f), juce::roundToInt(h * 0.943f),
         juce::roundToInt(w * 0.070f), juce::roundToInt(h * 0.031f));
-    themeSelect.setBounds(juce::roundToInt(w * 0.761f), juce::roundToInt(h * 0.057f),
-                          juce::roundToInt(w * 0.117f), juce::roundToInt(h * 0.034f));
+    // Theme moved into Settings to leave room for the new rotary dials.
     for (int row = 0; row < lanes; ++row)
     {
         // Native controls are positioned in the unscrolled content coordinate system.
         const float rowY = rowTop(row) + scrollY - clipTop;
-        const int y = juce::roundToInt(rowY + h * 0.004f);
-        divisions[static_cast<size_t>(row)].setBounds(
-            juce::roundToInt(w * 0.847f), y,
-            juce::roundToInt(w * 0.074f), juce::roundToInt(h * 0.030f));
-        timings[static_cast<size_t>(row)].setBounds(
-            juce::roundToInt(w * 0.847f), juce::roundToInt(rowY + h * 0.039f),
-            juce::roundToInt(w * 0.074f), juce::roundToInt(h * 0.029f));
+        timings[static_cast<size_t>(row)].setBounds(0,0,0,0);
+        divisions[static_cast<size_t>(row)].setBounds(0,0,0,0);
+        // Separate compact dials fit between the step grid (ends at 0.828)
+        // and the page buttons (begin at 0.939); no overlap at 1120px.
+        clockDials[row].setBounds(juce::roundToInt(w*0.841f),
+            juce::roundToInt(rowY + h*0.015f),
+            juce::roundToInt(w*0.050f), juce::roundToInt(h*0.050f));
+        timingDials[row].setBounds(juce::roundToInt(w*0.895f),
+            juce::roundToInt(rowY + h*0.020f),
+            juce::roundToInt(w*0.040f), juce::roundToInt(h*0.040f));
         prev[static_cast<size_t>(row)].setBounds(
             juce::roundToInt(getWidth() * 0.169f),
             juce::roundToInt(rowY + getHeight() * 0.051f),
@@ -633,24 +903,22 @@ void PolyrhythmMIDIEditor::resized()
             juce::roundToInt(getWidth() * 0.939f),
             juce::roundToInt(rowY + getHeight() * 0.051f),
             juce::roundToInt(getWidth() * 0.026f), juce::roundToInt(getHeight() * 0.034f));
-        if (row >= 7 && row < modRow)
+        if (row >= 7)
         {
-            ccSelect[row - 7].setBounds(juce::roundToInt(w * 0.240f),
-                juce::roundToInt(rowY + h * 0.003f), juce::roundToInt(w * 0.066f), juce::roundToInt(h * 0.027f));
-            ccLabelEditors[row - 7].setFont(font(h * 0.0185f, true));
-            ccLabelEditors[row - 7].setBounds(juce::roundToInt(w * 0.068f),
-                juce::roundToInt(rowY + h * 0.003f), juce::roundToInt(w * 0.159f), juce::roundToInt(h * 0.029f));
-            deleteCC[row - 7].setBounds(juce::roundToInt(w * 0.315f),
-                juce::roundToInt(rowY + h * 0.003f), juce::roundToInt(w * 0.023f), juce::roundToInt(h * 0.027f));
+            const int slot = row - 7;
+            ccLabelEditors[slot].setFont(font(h * 0.0152f, true));
+            ccLabelEditors[slot].setBounds(juce::roundToInt(w * 0.068f),
+                juce::roundToInt(rowY + h * 0.003f), juce::roundToInt(w * 0.098f), juce::roundToInt(h * 0.029f));
+            // Delete lives in the LEFT GUTTER, outside the lane panel.
+            deleteCC[slot].setBounds(juce::roundToInt(w * 0.021f),
+                juce::roundToInt(rowY + h * 0.002f), juce::roundToInt(w * 0.025f), juce::roundToInt(h * 0.031f));
+            // Compact role selectors remain in the upper (non-step) band.
+            laneTypeSelect[slot].setBounds(juce::roundToInt(w * 0.207f),
+                juce::roundToInt(rowY + h * 0.003f), juce::roundToInt(w * 0.105f), juce::roundToInt(h * 0.022f));
+            ccSelect[slot].setBounds(juce::roundToInt(w * 0.318f),
+                juce::roundToInt(rowY + h * 0.003f), juce::roundToInt(w * 0.065f), juce::roundToInt(h * 0.022f));
         }
     }
-    deleteChannelButton.setBounds(juce::roundToInt(w * 0.369f),
-        juce::roundToInt(rowTop(channelRow) + scrollY - clipTop + h * 0.003f),
-        juce::roundToInt(w * 0.023f), juce::roundToInt(h * 0.027f));
-    for (int i = 0; i < 5; ++i)
-        deleteDedicated[i].setBounds(juce::roundToInt(w * 0.280f),
-            juce::roundToInt(rowTop(modRow + i) + scrollY - clipTop + h * 0.003f),
-            juce::roundToInt(w * 0.023f), juce::roundToInt(h * 0.027f));
     syncCCVisibility();
 }
 void PolyrhythmMIDIEditor::updateButtons()
@@ -682,32 +950,21 @@ void PolyrhythmMIDIEditor::paint(juce::Graphics& g)
     const auto lavender = palette.lavender, amber = palette.amber, teal = palette.teal;
     const auto pink = palette.pink, cyan = palette.cyan;
     const juce::Colour colours[] {coral, blue, sage, lavender, amber, teal, pink, teal, amber, blue, coral, lavender, sage, pink, amber, teal, blue, lavender, pink, sage, amber};
-    const bool playing = processor.isHostPlaying();
-    const float shift = playing ? static_cast<float>(std::sin(huePhase * juce::MathConstants<double>::twoPi) * 0.008) : 0.0f;
-    juce::ColourGradient bg(paper.withRotatedHue(shift),
-                           0.0f, 0.0f, cream.withRotatedHue(shift),
-                           static_cast<float>(w), static_cast<float>(h), false);
-    bg.addColour(0.5, palette.middle.withRotatedHue(shift));
+    // No animated colour shifts: the header and footer stay static.
+    juce::ColourGradient bg(paper, 0.0f, 0.0f, cream,
+                            static_cast<float>(w), static_cast<float>(h), false);
+    bg.addColour(0.5, palette.middle);
     g.setGradientFill(bg); g.fillAll();
     g.setColour(paper.withAlpha(0.95f)); g.fillRect(0, 0, w, juce::roundToInt(h * 0.105f));
     g.setColour(coral); g.fillRect(0, juce::roundToInt(h * 0.103f), w, 2);
     // Audiowide is embedded in this plugin: no system font installation required.
-    const float titleFlash = processor.getAnimationsEnabled() && processor.isHostPlaying()
-        ? lane[0].stepLed : 0.0f;
-    g.setColour(coral.interpolatedWith(juce::Colours::white, titleFlash * 0.7f));
-    if (titleFlash > 0.02f)
-    {
-        g.setColour(coral.withAlpha(titleFlash * 0.24f));
-        g.fillRoundedRectangle(w * 0.046f, h * 0.015f, 11.0f, h * 0.073f, 4.0f);
-        g.setColour(coral.interpolatedWith(juce::Colours::white, titleFlash * 0.7f));
-    }
+    g.setColour(coral); // Static identity bar.
     g.fillRoundedRectangle(w * 0.049f, h * 0.018f, 4.0f, h * 0.067f, 2.0f);
-    // Header typography is rendered exactly once in paintOverChildren so it
-    // stays luminous above DARKNESS without duplicating expensive glyph runs.
+    // Header identity is drawn as normal text in paintStaticLabels().
     g.setColour(teal); g.fillRect(w * 0.061f, h * 0.090f, w * 0.031f, 2.0f);
     g.setColour(coral); g.fillRect(w * 0.099f, h * 0.090f, w * 0.011f, 2.0f);
     g.setColour(lavender); g.fillRect(w * 0.116f, h * 0.090f, w * 0.006f, 2.0f);
-    // Header labels, host indicator and dropdown surrounds share the light bus.
+    // Neon lane outlines are ordinary static graphics.
     g.saveState();
     g.reduceClipRegion(0, juce::roundToInt(h * 0.110f), w, juce::roundToInt(h * 0.815f));
     for (int row = 0; row < lanes; ++row)
@@ -731,8 +988,9 @@ void PolyrhythmMIDIEditor::paint(juce::Graphics& g)
         g.fillRoundedRectangle(accent, 2.0f);
         // Lane names and sequence-length captions are drawn in the light pass.
         const auto length = lengthBox(row);
-        g.setColour(colour.withAlpha(0.20f)); g.fillRoundedRectangle(length, 6.0f);
-        g.setColour(colour); g.drawRoundedRectangle(length, 6.0f, 1.3f);
+        // Fully coloured, steady length control: only the vertical rail pulses.
+        g.setColour(colour.withAlpha(0.93f)); g.fillRoundedRectangle(length, 6.0f);
+        g.setColour(colour.brighter(0.28f)); g.drawRoundedRectangle(length, 6.0f, 1.3f);
         // The counter-pulsing length value is drawn above the dimmer.
         // Low-contrast four-step grouping keeps visual phrasing readable.
         for (int group = 0; group < 4; ++group)
@@ -745,21 +1003,32 @@ void PolyrhythmMIDIEditor::paint(juce::Graphics& g)
                 first.getHeight() + 6.0f), 5.0f);
         }
         const int pageStart = l.page * 16;
-        const int seqStep = l.activeStep;
         for (int i = 0; i < visibleSteps; ++i)
         {
             const int index = pageStart + i;
             const bool inRange = index < l.length;
             const bool enabled = row == 0 && inRange && processor.getStepEnabled(index);
-            const bool active = seqStep == index && inRange;
             const auto bounds = cell(row, i);
             const bool editing = l.valueDrag && l.draggedStep == index;
             const float wiggle = editing ? static_cast<float>(std::sin(pulse * 2.3) * 0.035) : 0.0f;
             const float scale = editing ? 1.055f + wiggle : 1.0f;
             const auto drawBounds = bounds.withSizeKeepingCentre(bounds.getWidth() * scale,
                                                                   bounds.getHeight() * scale);
-            g.setColour(!inRange ? ink.withAlpha(0.08f) : paper.withAlpha(0.86f));
+            const bool darkTheme = paper.getPerceivedBrightness() < 0.50f;
+            // One-to-two-notch stronger constant lane-coloured backlight.
+            const float activity = juce::jlimit(0.0f, 1.0f, l.rangeOpacity[index]);
+            const auto lit = paper.interpolatedWith(colour,
+                darkTheme ? (0.32f + 0.30f * activity) : (0.19f + 0.22f * activity));
+            g.setColour(!inRange ? ink.withAlpha(0.08f) : lit);
             g.fillRoundedRectangle(drawBounds, 5.0f);
+            // A four-beat repeating gradation, dark -> light, reset every bar.
+            // Translucent fill only: border luminance stays unchanged.
+            if (inRange)
+            {
+                const float columnLight = 0.018f + (i % 4) * 0.023f;
+                g.setColour(colour.withAlpha(columnLight));
+                g.fillRoundedRectangle(drawBounds.reduced(1.0f), 4.0f);
+            }
             if (inRange)
             {
                 if (row == 0)
@@ -775,25 +1044,30 @@ void PolyrhythmMIDIEditor::paint(juce::Graphics& g)
                         g.setColour(ink.withAlpha(0.28f));
                         g.fillRect(inner.getX(), inner.getCentreY(), inner.getWidth(), 1.0f);
                     }
-                    else if (row == panRow)
+                    else if (isLaneType(row, PnordeLane::Type::pan))
                     {
                         g.setColour(ink.withAlpha(0.40f));
                         g.fillRect(inner.getCentreX(), inner.getY(), 1.0f, inner.getHeight());
                     }
-                    else if (row == vibratoRow)
+                    else if (isLaneType(row, PnordeLane::Type::vibrato))
                     {
                         const float depth = processor.getVibratoDepth(index) / 100.0f;
                         g.setColour(colour.withAlpha(0.30f));
                         g.fillRoundedRectangle(inner.withWidth(inner.getWidth() * depth), 2.0f);
                     }
                     g.setColour(colour.withAlpha(0.84f));
-                    const auto bar = parameterFillBounds(row, drawBounds, f);
+                    const auto bar = parameterFillBounds(row, drawBounds, f, processor.getOptionalLaneType(row));
                     if (!bar.isEmpty()) g.fillRoundedRectangle(bar, 3.0f);
                 }
             }
-            if (row >= 7 && row < modRow && inRange)
+            if ((row == 6 || (row >= 7 &&
+                !isLaneType(row, PnordeLane::Type::sustain) &&
+                !isLaneType(row, PnordeLane::Type::midiChannel))) && inRange)
             {
-                const float glide = processor.getCCTransitionMs(row - 7, index) / 100.0f;
+                const int glidePercent = row == 6 ? processor.getAftertouchGlide(index)
+                    : isLaneType(row, PnordeLane::Type::ccMacro) ? processor.getCCTransitionMs(row-7,index)
+                    : processor.getOptionalGlide(row,index);
+                const float glide = juce::jlimit(0.0f, 1.0f, glidePercent / 100.0f);
                 const juce::Rectangle<float> meter(bounds.getX() + 2.5f,
                     bounds.getBottom() - 8.0f,
                     juce::jmax(0.0f, bounds.getWidth() - 5.0f), 5.0f);
@@ -840,7 +1114,7 @@ void PolyrhythmMIDIEditor::paint(juce::Graphics& g)
         if (l.page == (l.length - 1) / 16)
         {
             const float x = l.displayX < 0.0f ? markerX(row) : l.displayX;
-            g.setColour(colour.withAlpha(0.7f));
+            g.setColour(colour.brighter(0.65f).withAlpha(0.95f));
             g.fillRect(x - 1.5f, top + h * 0.040f, 3.0f, h * 0.060f);
             if (l.rippleProgress < 1.0f)
             {
@@ -858,14 +1132,14 @@ void PolyrhythmMIDIEditor::paint(juce::Graphics& g)
             g.fillPath(triangle, juce::AffineTransform::scale(scale)
                         .rotated(wiggle).translated(x, top + h * 0.025f));
         }
-        if (row == panRow)
+        if (isLaneType(row, PnordeLane::Type::pan))
         {
             g.setColour(ink.withAlpha(0.65f)); g.setFont(font(h * 0.009f, true));
             g.drawText("L    C    R", juce::roundToInt(w * 0.120f),
                 juce::roundToInt(top + h * 0.075f), juce::roundToInt(w * 0.064f),
                 juce::roundToInt(h * 0.014f), juce::Justification::centred);
         }
-        g.setColour(ink.withAlpha(0.65f)); g.setFont(font(h * 0.012f));
+        g.setColour(ink.withAlpha(0.76f)); g.setFont(font(h * 0.012f));
         g.drawText("PAGE " + juce::String(l.page + 1) + "/" +
                     juce::String((l.length - 1) / 16 + 1),
                    juce::roundToInt(w * 0.847f), juce::roundToInt(top + h * 0.073f),
@@ -899,8 +1173,134 @@ void PolyrhythmMIDIEditor::paint(juce::Graphics& g)
     g.fillRect(0, juce::roundToInt(h * 0.925f), w, h - juce::roundToInt(h * 0.925f));
     g.setColour(coral.withAlpha(0.75f));
     g.fillRect(0, juce::roundToInt(h * 0.925f), w, 2);
-    // The credit is only drawn in the emissive footer overlay.
+    // Static typography is shared by normal and experimental modes.
+    // Paint BEFORE native child controls so labels can never cover editors.
+    paintStaticLabels(g);
+}
 
+void PolyrhythmMIDIEditor::paintStaticLabels(juce::Graphics& g)
+{
+    // Default public-alpha renderer: clean theme colours, crisp neon outlines,
+    // no multi-pass text halos, off-screen buffers or whole-window darkness.
+    const auto& t = themes[themeIndex];
+    const int w = getWidth(), h = getHeight();
+    const juce::Colour colours[] {t.coral,t.blue,t.sage,t.lavender,t.amber,t.teal,t.pink,
+        t.teal,t.amber,t.blue,t.coral,t.lavender,t.sage,t.pink,t.amber,
+        t.teal,t.blue,t.lavender,t.pink,t.sage,t.amber};
+    const auto label = [&](const juce::String& value, juce::Rectangle<int> bounds,
+                           juce::Colour colour, float size, bool strong = false)
+    {
+        g.setColour(colour);
+        g.setFont(font(size, strong));
+        g.drawText(value, bounds, juce::Justification::centred, false);
+    };
+    // Draw the header's identity once. Native dropdowns and buttons retain
+    // their ordinary JUCE text (no bloom pass).
+    // Identity typography is ALWAYS ON, regardless of Experimental.
+    // Load embedded Audiowide once, not once per repaint.
+    static const auto face = juce::Typeface::createSystemTypefaceFor(
+        AudiowideEmbedded::fontData, AudiowideEmbedded::fontSize);
+    auto logoFont = face != nullptr
+        ? juce::Font(juce::FontOptions(face).withHeight(h * 0.038f))
+        : font(h * 0.038f, true);
+    logoFont.setHorizontalScale(1.10f);
+    g.setColour(t.coral);
+    g.setFont(logoFont);
+    g.drawText("Pnorde", juce::Rectangle<int>{juce::roundToInt(w * 0.061f), juce::roundToInt(h * 0.014f),
+        juce::roundToInt(w * 0.165f), juce::roundToInt(h * 0.052f)},
+        juce::Justification::centredLeft, false);
+    label("D R E A M   S E Q U E N C E R",
+        {juce::roundToInt(w * 0.062f), juce::roundToInt(h * 0.065f),
+         juce::roundToInt(w * 0.171f), juce::roundToInt(h * 0.017f)},
+        t.teal, h * 0.012f);
+    const char* header[] {"GLOBAL OCTAVE", "KEY", "SCALE", "GLOBAL CLOCK", "BEND RANGE", "MANUAL BPM", "ADD LANE"};
+    const float headerX[] {0.249f, 0.360f, 0.440f, 0.584f, 0.669f, 0.750f, 0.885f};
+    const float headerW[] {0.097f, 0.075f, 0.137f, 0.078f, 0.080f, 0.131f, 0.099f};
+    for (int i = 0; i < 7; ++i)
+        label(header[i], {juce::roundToInt(w * headerX[i]), juce::roundToInt(h * 0.028f),
+                          juce::roundToInt(w * headerW[i]), juce::roundToInt(h * 0.024f)},
+              t.teal, h * 0.011f, true);
+    label(processor.isHostPlaying() ? "HOST PLAYING" : "HOST STOPPED",
+        {juce::roundToInt(w * 0.890f), juce::roundToInt(h * 0.010f),
+         juce::roundToInt(w * 0.098f), juce::roundToInt(h * 0.017f)},
+        t.sage, h * 0.011f);
+    {
+        juce::Graphics::ScopedSaveState clip(g);
+        g.reduceClipRegion(0, juce::roundToInt(h * 0.110f), w,
+                           juce::roundToInt(h * 0.815f));
+        for (int row = 0; row < lanes; ++row)
+        {
+            if (!rowVisible(row)) continue;
+            const float top = rowTop(row);
+            if (top + h * 0.110f < h * 0.11f || top > h * 0.925f) continue;
+            const auto colour = colours[row];
+            const auto& l = lane[row];
+            if (row < 7 || !isLaneType(row, PnordeLane::Type::ccMacro))
+                label(laneDisplayName(row),
+                    {juce::roundToInt(w * 0.064f), juce::roundToInt(top + h * 0.011f),
+                     juce::roundToInt(w * 0.105f), juce::roundToInt(h * 0.030f)},
+                    (t.paper.getPerceivedBrightness() < 0.50f
+                        ? colour.brighter(0.72f) : colour),
+                    h * (row < 7 ? 0.020f : 0.0145f), true);
+            // No permanent SEQ LENGTH caption: the length box gives contextual help.
+            auto lengthRect = lengthBox(row).toNearestInt();
+            const auto numeralColour = colour.getPerceivedBrightness() > 0.53f
+                ? juce::Colours::black : juce::Colours::white;
+            label(juce::String(l.length), lengthRect, numeralColour, h * 0.020f, true);
+            // Neon arrows are constant (not polyrhythmically animated).
+            g.setColour(colour.brighter(0.65f));
+            g.setFont(font(h * 0.017f, true));
+            g.drawText("<", lengthRect.removeFromLeft(juce::jmax(13, lengthRect.getWidth()/5)), juce::Justification::centred);
+            auto rightArrowRect = lengthBox(row).toNearestInt();
+            g.drawText(">", rightArrowRect.removeFromRight(juce::jmax(13, rightArrowRect.getWidth()/5)), juce::Justification::centred);
+            for (int i = 0; i < visibleSteps; ++i)
+            {
+                const int index = i + l.page * visibleSteps;
+                if (index >= l.length) continue;
+                const auto rect = cell(row, i);
+                const int val = l.values[index];
+                juce::String content;
+                if (row == 0) content = processor.getStepEnabled(index) ? "ON" : "OFF";
+                else if (isLaneType(row, PnordeLane::Type::midiChannel)) content = val ? juce::String(val) : "D";
+                else if (isLaneType(row, PnordeLane::Type::pan))
+                    content = val == 64 ? "C" : val < 64 ? "L" + juce::String(64 - val) : "R" + juce::String(val - 64);
+                else if (isLaneType(row, PnordeLane::Type::vibrato))
+                    content = "R" + juce::String(val) + "/D" + juce::String(processor.getVibratoDepth(index));
+                else if (isLaneType(row, PnordeLane::Type::sustain)) content = val >= 50 ? "ON" : "OFF";
+                else if (row == 1) content = juce::String(val / 10.0, 1);
+                else if (row == 4) content = juce::String(val);
+                else content = juce::String(val) + "%";
+                const bool activeNumber = processor.isHostPlaying() && l.activeStep == index;
+                label(stepNumberLabel(index),
+                    {juce::roundToInt(rect.getX()), juce::roundToInt(top + h * 0.029f),
+                     juce::roundToInt(rect.getWidth()), juce::roundToInt(h * 0.017f)},
+                    activeNumber ? colour.brighter(0.95f) : colour.withAlpha(0.84f),
+                    h * 0.0135f, activeNumber);
+                label(content, rect.toNearestInt(),
+                    t.paper.getPerceivedBrightness() < 0.50f ? colour.brighter(0.45f) : colour,
+                    h * (isLaneType(row, PnordeLane::Type::vibrato) ? 0.009f : 0.0135f), true);
+                if (l.activeStep == index && processor.isHostPlaying())
+                {
+                    g.setColour(colour.brighter(0.35f));
+                    g.drawRoundedRectangle(rect.expanded(1.3f), 4.5f, 1.9f);
+                }
+            }
+        }
+    }
+    label("MIDI OUT", {juce::roundToInt(w * 0.012f), juce::roundToInt(h * 0.946f),
+        juce::roundToInt(w * 0.047f), juce::roundToInt(h * 0.023f)},
+        t.teal, h * 0.010f, true);
+    // Footer credit is crisp and STATIC; no glow or light-bus redraws.
+    label("Vibe Coded By",
+        {juce::roundToInt(w * 0.673f), juce::roundToInt(h * 0.940f),
+         juce::roundToInt(w * 0.119f), juce::roundToInt(h * 0.032f)},
+        t.pink, h * 0.012f);
+    g.setColour(t.pink);
+    g.setFont(font(h * 0.023f, true));
+    g.drawText(juce::String::fromUTF8("LДNTERNS"),
+        juce::Rectangle<int>{juce::roundToInt(w * 0.796f), juce::roundToInt(h * 0.938f),
+         juce::roundToInt(w * 0.141f), juce::roundToInt(h * 0.039f)},
+        juce::Justification::centred, false);
 }
 
 void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
@@ -908,32 +1308,110 @@ void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
     const auto& palette = themes[themeIndex];
     const auto ink = palette.ink;
     const juce::Colour colours[] {palette.coral, palette.blue, palette.sage, palette.lavender,
-        palette.amber, palette.teal, palette.pink, palette.teal, palette.amber, palette.blue, palette.coral, palette.lavender, palette.sage, palette.pink, palette.amber, palette.teal, palette.blue, palette.lavender, palette.pink, palette.sage, palette.amber};
+        palette.amber, palette.teal, palette.pink, palette.teal, palette.amber,
+        palette.blue, palette.coral, palette.lavender, palette.sage, palette.pink,
+        palette.amber, palette.teal, palette.blue, palette.lavender,
+        palette.pink, palette.sage, palette.amber};
     const int w = getWidth(), h = getHeight();
-    // Draw a neutral dimmer ABOVE all JUCE child controls, preserving their
-    // colours, then draw the musical clock lights above the dimmer.
-    const float darkness = processor.getDarknessPercent() / 100.0f;
-    if (darkness > 0.001f)
+    juce::Graphics::ScopedSaveState restoreAll(g);
+    // Parent paintOverChildren is composited after its children. Never repaint
+    // over the CallOutBox, including its border, even if it overlaps lanes.
+    if (settingsCallout != nullptr)
+        g.excludeClipRegion(settingsCallout->getBounds().reduced(3));
+
+    // The lighting bus is restricted to the sequencer rectangle. Header,
+    // footer, normal labels and native controls do not participate.
+    if (processor.getExperimentalLightsEnabled())
     {
-        g.setColour(juce::Colours::black.withAlpha(darkness));
-        g.fillRect(getLocalBounds());
-    }
-    // All light emitters share the same PnordeLights envelope and bloom model.
-    // Clock-accurate lane rails stay in phase with the sound; secondary lights
-    // use lane-specific offsets for a gentle polyrhythmic shimmer.
-    // Emitters stay faintly illuminated when stopped; only the timed pulse
-    // requires transport playback. This keeps gate-on LEDs visible in darkness.
-    const bool playingLights = processor.getAnimationsEnabled() && processor.isHostPlaying();
-    {
-        g.saveState();
-        g.reduceClipRegion(0, juce::roundToInt(h * 0.110f), w, juce::roundToInt(h * 0.815f));
+        juce::Graphics::ScopedSaveState laneClip(g);
+        g.reduceClipRegion(0, juce::roundToInt(h * 0.110f), w,
+                           juce::roundToInt(h * 0.815f));
+        const float darkness = processor.getDarknessPercent() / 100.0f;
+        if (darkness > 0.001f)
+        {
+            // v0.5.6.1: Restore the full-width v0.5.5 work-area dimmer.
+            // v0.5.6 restricted it to the step grid; light-theme side panels
+            // therefore stayed glaringly bright when DARKNESS was enabled.
+            // Keep only the four kinds of interactive lane dropdowns and Macro
+            // text editors clear. Exclusions apply ONLY to this darkness pass,
+            // never to the step-light pass that follows.
+            {
+                juce::Graphics::ScopedSaveState dimmerClip(g);
+                const int contentToEditorY = juce::roundToInt(h * 0.110f - scrollY);
+                const auto protectControl = [&g, contentToEditorY](const juce::Component& control)
+                {
+                    if (!control.isVisible()) return;
+                    auto bounds = control.getBounds();
+                    bounds.translate(0, contentToEditorY);
+                    if (!bounds.isEmpty()) g.excludeClipRegion(bounds);
+                };
+                for (int row = 0; row < lanes; ++row)
+                {
+                    if (!rowVisible(row)) continue;
+                    const float top = rowTop(row);
+                    if (top > h * 0.925f || top + h * 0.105f < h * 0.110f)
+                        continue;
+                    // Do not cut a rectangular hole in the darkness for a round dial.
+                    // The circles/rings are rendered over the dark mask below.
+                    if (row >= 7)
+                    {
+                        const int slot = row - 7;
+                        protectControl(laneTypeSelect[slot]);
+                        protectControl(ccSelect[slot]);
+                        // Preserve native Macro editing/caret visibility. The
+                        // editor's text must not be drawn a second time.
+                        protectControl(ccLabelEditors[slot]);
+                        if (deleteCC[slot].isMouseOver()) protectControl(deleteCC[slot]);
+                    }
+                }
+                g.setColour(juce::Colours::black.withAlpha(darkness));
+                g.fillRect(0, juce::roundToInt(h * 0.110f), w,
+                           juce::roundToInt(h * 0.815f));
+            }
+            // Overlay only the two small luminous dial faces after darkness.
+            // No excluded rectangular regions, no animated control bloom.
+            for (int row = 0; row < lanes; ++row)
+            {
+                if (!rowVisible(row)) continue;
+                const float top = rowTop(row);
+                if (top > h * 0.925f || top + h * 0.105f < h * 0.110f) continue;
+                const int translateY = juce::roundToInt(h * 0.110f - scrollY);
+                const auto a = clockDials[row].getBounds();
+                const auto b = timingDials[row].getBounds();
+                clockDials[row].drawIllumination(g, (float)a.getX(), (float)(a.getY()+translateY));
+                timingDials[row].drawIllumination(g, (float)b.getX(), (float)(b.getY()+translateY));
+            }
+            // Titles are static text in the underlay; redraw only the fixed
+            // lane names above the dimmer. No re-render of Macro text editors.
+            // This does not modulate their brightness with the lane clocks.
+            for (int row = 0; row < lanes; ++row)
+            {
+                if (!rowVisible(row)) continue;
+                const float top = rowTop(row);
+                if (top > h * 0.925f || top + h * 0.105f < h * 0.110f)
+                    continue;
+                if (row >= 7 && isLaneType(row, PnordeLane::Type::ccMacro))
+                    continue;
+                const auto colour = colours[row];
+                g.setColour(colour.brighter(0.72f));
+                g.setFont(font(h * (row < 7 ? 0.020f : 0.0145f), true));
+                g.drawText(laneDisplayName(row),
+                    juce::Rectangle<int>{juce::roundToInt(w * 0.064f),
+                        juce::roundToInt(top + h * 0.011f),
+                        juce::roundToInt(w * 0.105f),
+                        juce::roundToInt(h * 0.030f)},
+                    juce::Justification::centred, false);
+            }
+        }
+        const bool playingLights = processor.getAnimationsEnabled() && processor.isHostPlaying();
         for (int row = 0; row < lanes; ++row)
         {
             if (!rowVisible(row)) continue;
             const float top = rowTop(row);
             if (top > h * 0.925f || top + h * 0.105f < h * 0.110f) continue;
             if (!g.getClipBounds().toFloat().intersects(
-                    juce::Rectangle<float>(0, top - h * 0.013f, static_cast<float>(w), h * 0.128f)))
+                    juce::Rectangle<float>(0, top - h * 0.013f,
+                                           static_cast<float>(w), h * 0.128f)))
                 continue;
             const auto& l = lane[static_cast<size_t>(row)];
             const auto colour = colours[row];
@@ -954,10 +1432,12 @@ void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
                 const int ahead = current < 0 ? length
                     : (index - current + length) % length;
                 const float phase = l.stepPhase;
+                // Only nearby cells can have a perceptible travelling halo.
+                // Avoid dozens of unnecessary exponential calls per repaint.
                 const float trail = current < 0 ? 0.0f :
-                    juce::jlimit(0.0f, 1.0f, static_cast<float>(
-                        std::exp(-1.4f * (static_cast<float>(behind) + phase))
-                        + 0.13f * std::exp(-1.8f * static_cast<float>(ahead))));
+                    juce::jlimit(0.0f, 1.0f,
+                        (behind < 5 ? std::exp(-1.4f * (static_cast<float>(behind) + phase)) : 0.0f)
+                        + (ahead < 3 ? 0.13f * std::exp(-1.8f * static_cast<float>(ahead)) : 0.0f));
                 const float motion = processor.getAnimationsEnabled() ? trail : 0.0f;
                 const bool gateOn = row == 0 && processor.getStepEnabled(index);
                 PnordeLights::cellBackdrop(g, bounds, colour, darkness,
@@ -968,13 +1448,13 @@ void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
                         PnordeLights::cellFill(g, bounds.reduced(1.6f), colour,
                             darkness, motion, current == index ? led : 0.0f);
                 }
-                else if (row != channelRow)
+                else if (!isLaneType(row, PnordeLane::Type::midiChannel))
                 {
                     const float f = juce::jlimit(0.0f, 1.0f, l.visualFill[index]);
-                    const auto fill = parameterFillBounds(row, bounds, f);
+                    const auto fill = parameterFillBounds(row, bounds, f, processor.getOptionalLaneType(row));
                     PnordeLights::cellFill(g, fill, colour, darkness,
                         motion, current == index ? led : 0.0f);
-                    if (row == vibratoRow)
+                    if (isLaneType(row, PnordeLane::Type::vibrato))
                     {
                         const auto inner = bounds.reduced(2.0f);
                         const float depth = processor.getVibratoDepth(index) / 100.0f;
@@ -1029,7 +1509,7 @@ void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
                         juce::jmax(1.0f, travel - 4.0f), 2.0f, 1.0f);
 
                     // Illuminated per-parameter level slider tip.
-                    if (row != 0 && row != channelRow)
+                    if (row != 0 && !isLaneType(row, PnordeLane::Type::midiChannel))
                     {
                         const int index = l.activeStep;
                         const float f = juce::jlimit(0.0f, 1.0f, l.visualFill[index]);
@@ -1043,257 +1523,91 @@ void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
                     }
                 }
             }
-            // Clock-division control gets a subtle lighting trace whose speed
-            // follows the same lane (not the global SEQ lane).
-            const auto control = divisions[row].getBounds();
-            // Child coordinates belong to scrollContent; translate to editor.
-            const float cy = top + h * 0.004f;
-            PnordeLights::outline(g,
-                {static_cast<float>(control.getX()), cy,
-                 static_cast<float>(control.getWidth()), h * 0.030f},
-                colour, 0.20f + 0.42f * led, darkness, 3.0f);
-
-            // Independent lane-length LED: its attack is HALF A CYCLE away
-            // from this lane's main rail pulse, while still respecting that
-            // lane's division and swing/triplet timing.
-            const float opposite = playingLights
-                ? PnordeLights::offsetPulse(l.stepPhase, 0.5f, l.stepDurationMs)
-                : 0.0f;
-            const auto lengthRect = lengthBox(row);
-            PnordeLights::outline(g, lengthRect.expanded(1.3f), colour,
-                0.13f + opposite * 0.86f, darkness, 6.0f);
-
-            // Restore text ABOVE the darkness layer, including light-emitting
-            // lane names, step numbers and values. Static cells get a clean,
-            // low-cost core; only the active cell gets the multi-pass halo.
-            if (row < 7 || row >= modRow)
-                PnordeLights::text(g, names[row],
-                    {juce::roundToInt(w * 0.068f), juce::roundToInt(top),
-                     juce::roundToInt(w * 0.125f), juce::roundToInt(h * 0.024f)},
-                    font(h * (row >= modRow ? 0.014f : 0.0185f), true),
-                    colour, 0.26f + 0.50f * led, darkness);
-            else if (!ccLabelEditors[row - 7].hasKeyboardFocus(true))
-                PnordeLights::text(g, ccLabelEditors[row - 7].getText(),
-                    {juce::roundToInt(w * 0.068f), juce::roundToInt(top + h * 0.003f),
-                     juce::roundToInt(w * 0.159f), juce::roundToInt(h * 0.029f)},
-                    font(h * 0.0185f, true), colour,
-                    0.24f + 0.55f * led, darkness);
-            PnordeLights::text(g, "SEQ LENGTH",
-                {juce::roundToInt(w * 0.073f), juce::roundToInt(top + h * 0.025f),
-                 juce::roundToInt(w * 0.089f), juce::roundToInt(h * 0.017f)},
-                font(h * 0.011f), colour, 0.19f + 0.35f * opposite,
-                darkness, juce::Justification::centred, 0);
-            PnordeLights::text(g, juce::String(l.length) + "  ↔",
-                lengthRect.toNearestInt(), font(h * 0.020f, true), colour,
-                0.35f + 0.65f * opposite, darkness,
-                juce::Justification::centred, 1);
-
-            for (int i = 0; i < visibleSteps; ++i)
+            // The current step number must be luminous ABOVE Experimental Darkness.
+            // Redraw only one label per visible lane; the other numbers stay static.
+            if (playingLights && l.activeStep >= 0 && l.activeStep < l.length)
             {
-                const int index = l.page * visibleSteps + i;
-                if (index >= l.length) continue;
-                const auto b = cell(row, i);
-                const bool selected = l.activeStep == index;
-                const float brightness = selected ? juce::jlimit(0.0f, 1.0f,
-                    0.45f + 0.50f * led)
-                    : l.hovered == i ? 0.48f : 0.12f;
-                PnordeLights::text(g, stepNumberLabel(index),
-                    {juce::roundToInt(b.getX()), juce::roundToInt(top + h * 0.029f),
-                     juce::roundToInt(b.getWidth()), juce::roundToInt(h * 0.020f)},
-                    font(h * 0.014f, true), colour, brightness,
-                    darkness, juce::Justification::centred, selected ? 1 : 0);
+                const int localStep = l.activeStep - l.page * visibleSteps;
+                if (localStep >= 0 && localStep < visibleSteps)
+                {
+                    const auto b = cell(row, localStep);
+                    g.setColour(colour.brighter(0.95f));
+                    g.setFont(font(h * 0.0145f, true));
+                    g.drawText(stepNumberLabel(l.activeStep),
+                        juce::Rectangle<int>(juce::roundToInt(b.getX()),
+                            juce::roundToInt(top + h * 0.029f),
+                            juce::roundToInt(b.getWidth()), juce::roundToInt(h * 0.017f)),
+                        juce::Justification::centred);
+                }
+            }
+            // The draggable end-of-sequence marker is always bright, not tempo-pulsed.
+            if (l.page == (l.length - 1) / visibleSteps)
+            {
+                const auto x = l.displayX < 0.0f ? markerX(row) : l.displayX;
+                const auto y = top + h * 0.025f;
+                g.setColour(colour.brighter(0.55f).withAlpha(0.92f));
+                g.fillRoundedRectangle(x-2.0f, top + h*0.039f,
+                    4.0f, h*0.051f, 1.7f);
+                juce::Path triangle;
+                triangle.addTriangle(x-7.0f,y-5.0f,x+7.0f,y-5.0f,x,y+7.0f);
+                g.fillPath(triangle);
+            }
+            // Clock division, lane type and CC number controls are statically
+            // backlit through their native JUCE themed backgrounds, not animated.
 
-                if (row == 6) continue;
-                const int v = l.values[static_cast<size_t>(index)];
-                const juce::String value = row == 0
-                    ? (processor.getStepEnabled(index) ? "ON" : "OFF")
-                    : row == 1 ? (v > 0 ? "+" : "") +
-                        (processor.getScale() == 13 ? juce::String(v / 10.0, 1) : juce::String(v / 10))
-                    : row == 4 ? (v > 0 ? "+" : "") + juce::String(v)
-                    : row == channelRow ? (v == 0 ? "D" : juce::String(v))
-                    : row == panRow ? (v == 64 ? "C" : v < 64
-                        ? "L" + juce::String(64 - v) : "R" + juce::String(v - 64))
-                    : row == vibratoRow ? ("R" + juce::String(v) + "/D" +
-                        juce::String(processor.getVibratoDepth(index)))
-                    : row == sustainRow ? (v >= 50 ? "ON" : "OFF")
-                    : juce::String(v) + "%";
-                PnordeLights::text(g, value, b.toNearestInt(),
-                    font(h * (row == vibratoRow ? 0.010f : 0.015f), true),
-                    colour, brightness * 0.75f, darkness,
-                    juce::Justification::centred, selected ? 1 : 0);
+            // Bright, steady label/length controls. The narrow vertical rail
+            // above is the ONLY polyrhythmically flashing lane-header element.
+            if (darkness > 0.005f)
+            {
+                const auto box = lengthBox(row);
+                g.setColour(colour.withAlpha(0.96f));
+                g.fillRoundedRectangle(box, 6.0f);
+                g.setFont(font(h * 0.020f, true));
+                g.setColour(colour.getPerceivedBrightness() > 0.53f
+                    ? juce::Colours::black : juce::Colours::white);
+                g.drawText(juce::String(l.length), box.toNearestInt(), juce::Justification::centred);
+                g.setColour(colour.brighter(0.65f));
+                g.setFont(font(h * 0.017f, true));
+                auto left = box.toNearestInt(); auto right = left;
+                g.drawText("<", left.removeFromLeft(juce::jmax(13, left.getWidth()/5)), juce::Justification::centred);
+                g.drawText(">", right.removeFromRight(juce::jmax(13, right.getWidth()/5)), juce::Justification::centred);
             }
 
-            // The child ComboBox text stays dark for contrast. Only the
-            // housing takes on its theme-paper colour and an LED outline.
-            for (auto* combo : std::array<juce::ComboBox*, 2>{ { &divisions[row], &timings[row] } })
-            {
-                const auto local = combo->getBounds();
-                const auto rect = juce::Rectangle<float>(
-                    static_cast<float>(local.getX()),
-                    static_cast<float>(local.getY()) - scrollY + h * 0.110f,
-                    static_cast<float>(local.getWidth()),
-                    static_cast<float>(local.getHeight()));
-                g.setColour(palette.paper.withAlpha(0.035f + 0.085f * led));
-                g.fillRoundedRectangle(rect.reduced(0.5f), 3.5f);
-                PnordeLights::outline(g, rect.expanded(1.0f),
-                    palette.paper.interpolatedWith(colour, 0.20f),
-                    0.21f + 0.27f * led, darkness, 4.0f);
-            }
-            if (row >= 7 && row < modRow)
-            {
-                const auto cb = ccSelect[row - 7].getBounds();
-                PnordeLights::outline(g,
-                    {static_cast<float>(cb.getX()),
-                     static_cast<float>(cb.getY()) - scrollY + h * 0.110f,
-                     static_cast<float>(cb.getWidth()), static_cast<float>(cb.getHeight())},
-                    palette.paper, 0.25f + 0.19f * led, darkness, 4.0f);
-            }
-
-            // Small page, delete and navigation button labels also belong to
-            // the emissive text family. Their parent is scrollContent, so
-            // translate rectangles to editor coordinates only when visible.
-            auto lightButton = [&](const juce::TextButton& button)
-            {
-                if (!button.isVisible() || !button.isEnabled()) return;
-                auto rect = button.getBounds();
-                rect.translate(0, juce::roundToInt(h * 0.110f - scrollY));
-                if (rect.getBottom() <= h * 0.110f || rect.getY() >= h * 0.925f)
-                    return;
-                PnordeLights::outline(g, rect.toFloat().expanded(0.6f),
-                    palette.paper, 0.12f + led * 0.21f, darkness, 3.0f);
-                PnordeLights::text(g, button.getButtonText(), rect,
-                    font(h * 0.012f, true), colour, 0.18f + 0.43f * led,
-                    darkness, juce::Justification::centred, 0);
-            };
-            lightButton(prev[row]);
-            lightButton(next[row]);
-            lightButton(addPage[row]);
-            lightButton(removePage[row]);
-            if (row >= 7 && row < modRow) lightButton(deleteCC[row - 7]);
-            if (row == channelRow) lightButton(deleteChannelButton);
-            if (row >= modRow && row < channelRow)
-                lightButton(deleteDedicated[row - modRow]);
         }
-        g.restoreState();
     }
-    // Global light bus: the footer breathes with the host clock, advanced 45°.
-    // Unlike lane clocks, this uses the global division to keep buttons and
-    // signature gently unified without pushing any real MIDI events.
-    const float footerGlow = playingLights
-        ? PnordeLights::softPulse(globalStepPhase, 0.125f) : 0.22f;
-    const float footerIntensity = 0.18f + 0.64f * footerGlow;
-    const auto footerColour = palette.pink.interpolatedWith(palette.cyan, 0.17f);
 
-    // Highlight the middle of the header with luminous traces rather than a
-    // large opaque wash that would obscure dropdown text.
+    // Experimental reorder indicator is separate from data and MIDI routing.
+    if (laneDragActive && dragTargetRow >= 7 && rowVisible(dragTargetRow))
     {
-        const float activity = playingLights ? globalLed : 0.0f;
-        const juce::Rectangle<float> trace(w * 0.230f, h * 0.099f,
-                                           w * 0.755f, 2.0f);
-        g.setColour(palette.teal.withAlpha(0.020f + 0.055f * activity));
-        g.fillRoundedRectangle(w * 0.230f, h * 0.024f,
-                               w * 0.754f, h * 0.071f, 12.0f);
-        g.setColour(palette.teal.withAlpha(0.085f + 0.24f * activity));
-        g.fillRoundedRectangle(trace.expanded(0.0f, 4.0f), 3.0f);
-        g.setColour(palette.cyan.withAlpha(0.28f + 0.43f * activity));
-        g.fillRoundedRectangle(trace, 1.0f);
+        const float y = rowTop(dragTargetRow) - h * 0.012f;
+        g.setColour(palette.cyan.withAlpha(0.88f));
+        g.fillRoundedRectangle(w * 0.050f, y, w * 0.917f, 3.0f, 1.5f);
     }
-    PnordeLights::text(g, "Pnorde",
-        {juce::roundToInt(w * 0.061f), juce::roundToInt(h * 0.014f),
-         juce::roundToInt(w * 0.28f), juce::roundToInt(h * 0.052f)},
-        [&] { static const auto face = juce::Typeface::createSystemTypefaceFor(
-            AudiowideEmbedded::fontData, AudiowideEmbedded::fontSize);
-            auto f = face != nullptr
-                ? juce::Font(juce::FontOptions(face).withHeight(h * 0.038f))
-                : font(h * 0.038f, true);
-            f.setHorizontalScale(1.10f); return f; }(),
-        palette.coral, 0.42f + 0.53f * globalLed, darkness,
-        juce::Justification::centredLeft, 2);
-    PnordeLights::text(g, "D R E A M   S E Q U E N C E R",
-        {juce::roundToInt(w * 0.062f), juce::roundToInt(h * 0.065f),
-         juce::roundToInt(w * 0.171f), juce::roundToInt(h * 0.017f)},
-        font(h * 0.012f), palette.teal,
-        0.29f + 0.47f * globalLed, darkness);
-    PnordeLights::text(g, "MIDI OUT",
-        {juce::roundToInt(w * 0.239f), juce::roundToInt(h * 0.034f),
-         juce::roundToInt(w * 0.098f), juce::roundToInt(h * 0.020f)},
-        font(h * 0.012f, true), palette.teal, 0.20f + 0.53f * globalLed,
-        darkness);
-    const char* labels[] { "KEY", "SCALE", "GLOBAL CLOCK", "BEND RANGE", "THEME", "ADD LANE" };
-    const float labelXs[] { 0.365f, 0.433f, 0.581f, 0.669f, 0.761f, 0.885f };
-    const float labelWidths[] { 0.060f, 0.140f, 0.080f, 0.080f, 0.120f, 0.100f };
-    for (int i = 0; i < 6; ++i)
-        PnordeLights::text(g, labels[i],
-            {juce::roundToInt(w * labelXs[i]), juce::roundToInt(h * 0.034f),
-             juce::roundToInt(w * labelWidths[i]), juce::roundToInt(h * 0.020f)},
-            font(h * 0.012f, true), palette.teal,
-            0.20f + 0.41f * globalLed, darkness);
-    PnordeLights::text(g, processor.isHostPlaying() ? "HOST PLAYING" : "HOST STOPPED",
-        {juce::roundToInt(w * 0.865f), juce::roundToInt(h * 0.011f),
-         juce::roundToInt(w * 0.108f), juce::roundToInt(h * 0.030f)},
-        font(h * 0.012f, true), palette.sage,
-        0.21f + 0.61f * globalLed, darkness, juce::Justification::centredRight);
-
-    // All closed dropdowns keep dark selected-item text. Only their themed
-    // backgrounds / outlines bloom; popup menu text isn't touched at all.
-    for (auto* cb : std::array<juce::ComboBox*, 6>{ {
-         &midiOutputSelect, &keySelect, &scaleSelect,
-         &globalClockSelect, &bendRangeSelect, &themeSelect } })
+    // SLIDE is intentionally visible and interactive in microtonal mode:
+    // its saved 0..100% values set the tempo-relative pitch approach time.
+    // Contextual help only while a sequence-length box is pressed/dragged.
+    // The lane title remains uncluttered when the control is idle.
+    for (int row = 0; row < lanes; ++row)
     {
-        g.setColour(palette.paper.withAlpha(0.035f + 0.080f * globalLed));
-        g.fillRoundedRectangle(cb->getBounds().toFloat().reduced(0.5f), 4.0f);
-        PnordeLights::outline(g, cb->getBounds().toFloat().expanded(1.1f),
-            palette.paper.interpolatedWith(palette.teal, 0.12f),
-            0.24f + 0.30f * globalLed, darkness, 4.5f);
+        if (!rowVisible(row) || !lane[row].lengthDrag) continue;
+        const auto b = lengthBox(row);
+        const float helpW = juce::jmin(210.0f, w * 0.20f);
+        const float x = juce::jlimit(8.0f, w - helpW - 8.0f, b.getX());
+        const float y = juce::jlimit(h * 0.115f, h * 0.925f - 28.0f,
+                                   b.getBottom() + 5.0f);
+        const juce::Rectangle<float> popup(x, y, helpW, 24.0f);
+        g.setColour(palette.paper.contrasting(0.14f));
+        g.fillRoundedRectangle(popup, 4.0f);
+        g.setColour(colours[row].brighter(0.30f));
+        g.drawRoundedRectangle(popup, 4.0f, 1.4f);
+        g.setFont(font(12.0f, true));
+        g.setColour(palette.ink);
+        g.drawText("Set Sequence Length: " + juce::String(lane[row].length),
+                   popup.toNearestInt(), juce::Justification::centred, false);
+        break;
     }
-    PnordeLights::outline(g, refreshMidiOutputs.getBounds().toFloat().expanded(0.5f),
-        palette.paper, 0.22f + globalLed * 0.42f, darkness, 3.0f);
-    PnordeLights::text(g, refreshMidiOutputs.getButtonText(),
-        refreshMidiOutputs.getBounds(), font(h * 0.011f, true),
-        palette.teal, 0.18f + 0.46f * globalLed,
-        darkness, juce::Justification::centred, 0);
-    // ADD LANE deliberately receives the stronger header pulse.
-    PnordeLights::outline(g, addCCButton.getBounds().toFloat().expanded(1.0f),
-        palette.teal, 0.29f + 0.57f * globalLed, darkness, 4.5f);
-    PnordeLights::text(g, "+ ADD LANE", addCCButton.getBounds(),
-        font(h * 0.013f, true), palette.teal, 0.31f + 0.62f * globalLed,
-        darkness, juce::Justification::centred);
-
-    // Footer text, controls and settings all share the phase-shifted pulse.
-    for (auto* control : { &savePresetButton, &loadPresetButton,
-                           &randomiseButton, &presetFolderButton, &settingsButton })
-    {
-        const auto bounds = control->getBounds();
-        PnordeLights::outline(g, bounds.toFloat().expanded(0.6f),
-            palette.paper.interpolatedWith(palette.coral, 0.24f),
-            footerIntensity, darkness, 4.0f);
-        PnordeLights::text(g, control->getButtonText(), bounds,
-            font(h * 0.012f, true), footerColour,
-            footerIntensity, darkness, juce::Justification::centred);
-    }
-    // The slider is a child control too; illuminate its track and value box
-    // around (not over) the value so it remains readable.
-    PnordeLights::outline(g, darknessSlider.getBounds().toFloat().reduced(1.0f),
-        palette.paper, 0.12f + footerIntensity * 0.44f, darkness, 4.0f);
-    PnordeLights::text(g, "DARKNESS",
-        {juce::roundToInt(w * 0.042f), juce::roundToInt(h * 0.942f),
-         juce::roundToInt(w * 0.070f), juce::roundToInt(h * 0.031f)},
-        font(h * 0.011f, true), footerColour, footerIntensity,
-        darkness, juce::Justification::centredRight);
-    PnordeLights::text(g, "Vibe Coded By",
-        {juce::roundToInt(w * 0.672f), juce::roundToInt(h * 0.941f),
-         juce::roundToInt(w * 0.120f), juce::roundToInt(h * 0.029f)},
-        font(h * 0.012f), footerColour, footerIntensity,
-        darkness, juce::Justification::centredRight, 2);
-    PnordeLights::signature(g, juce::String::fromUTF8("LДNTERNS"),
-        {juce::roundToInt(w * 0.796f),
-         juce::roundToInt(h * 0.941f) - juce::roundToInt(h * 0.005f),
-         juce::roundToInt(w * 0.141f), juce::roundToInt(h * 0.040f)},
-        font(h * 0.023f, true), palette.pink,
-        0.35f + footerGlow * 0.65f, darkness);
-
-    // Drawn above child controls, anchored to the edited step (not the pointer).
-    g.reduceClipRegion(0, juce::roundToInt(h * 0.110f), w, juce::roundToInt(h * 0.815f));
+    // Transient widgets are UI feedback, NOT part of the Experimental bus.
+    // Protect the work-area clipping but let the popup extend above the cell.
     // Slim glowing scrollbar that fades after interaction.
     if (maxScroll() > 0.5f && scrollbarOpacity > 0.01f)
     {
@@ -1309,16 +1623,25 @@ void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
         g.setColour(palette.cyan.withAlpha(scrollbarOpacity * 0.85f));
         g.fillRoundedRectangle(x, y, 3.0f, thumbHeight, 2.0f);
     }
-    if (ccPopupRow >= 7 && ccPopupRow < modRow && ccPopupStep >= 0 && ccPopupAlpha > 0.0f)
+    if (ccPopupRow >= 6 && ccPopupRow < lanes &&
+        (ccPopupRow == 6 || (ccPopupRow >= 7 &&
+         !isLaneType(ccPopupRow, PnordeLane::Type::sustain) &&
+         !isLaneType(ccPopupRow, PnordeLane::Type::midiChannel))) &&
+        ccPopupStep >= 0 && ccPopupStep < PolyrhythmMIDIProcessor::maxSteps &&
+        ccPopupAlpha > 0.0f)
     {
         const int slot = ccPopupRow - 7;
-        const int percent = processor.getCCTransitionMs(slot, ccPopupStep);
+        const int percent = ccPopupRow == 6 ? processor.getAftertouchGlide(ccPopupStep)
+            : isLaneType(ccPopupRow, PnordeLane::Type::ccMacro)
+                ? processor.getCCTransitionMs(slot, ccPopupStep)
+                : processor.getOptionalGlide(ccPopupRow, ccPopupStep);
+        const int scaled = juce::jlimit(0, 100, percent);
         const int visibleIndex = ccPopupStep - lane[static_cast<size_t>(ccPopupRow)].page * 16;
         if (visibleIndex < 0 || visibleIndex >= visibleSteps) return;
         const auto stepBounds = cell(ccPopupRow, visibleIndex);
         const float x = juce::jlimit(45.0f, w - 45.0f, stepBounds.getCentreX());
         // Anchor above the step, regardless of mouse movement. Can overlap adjacent rows.
-        const float y = juce::jlimit(47.0f, h - 48.0f, stepBounds.getY() - 44.0f);
+        const float y = juce::jlimit(62.0f, h - 48.0f, stepBounds.getY() - 44.0f);
         const juce::Rectangle<float> dial(x - 32.0f, y - 32.0f, 64.0f, 64.0f);
         g.setColour(juce::Colours::white.withAlpha(ccPopupAlpha * 0.96f));
         g.fillEllipse(dial);
@@ -1327,30 +1650,61 @@ void PolyrhythmMIDIEditor::paintOverChildren(juce::Graphics& g)
         const float start = juce::MathConstants<float>::pi * 0.75f;
         juce::Path arc;
         arc.addCentredArc(x, y, 25.0f, 25.0f, 0.0f, start,
-            start + juce::MathConstants<float>::pi * 1.5f * percent / 100.0f, true);
-        const auto dialColour = glideColour(colours[static_cast<size_t>(ccPopupRow)], percent / 100.0f);
+            start + juce::MathConstants<float>::pi * 1.5f * scaled / 100.0f, true);
+        const auto dialColour = glideColour(colours[static_cast<size_t>(ccPopupRow)], scaled / 100.0f);
         g.setColour(dialColour.withAlpha(ccPopupAlpha));
         g.strokePath(arc, juce::PathStrokeType(4.5f));
-        g.setColour(ink.withAlpha(ccPopupAlpha));
+        g.setColour(juce::Colours::black.withAlpha(ccPopupAlpha));
         g.setFont(font(14.0f, true));
-        g.drawText(juce::String(percent) + "%", dial.toNearestInt(), juce::Justification::centred);
-        g.setFont(font(10.0f, true));
-        g.drawText("GLIDE", juce::roundToInt(x - 28), juce::roundToInt(y + 34),
-            56, 14, juce::Justification::centred);
+        const juce::String glideText = percent < 0 ? "AUTO"
+            : percent > 100 ? juce::String((percent-101)*0.1f,1)+" s"
+            : juce::String(scaled) + "%"; // New glide is tempo-relative.
+        g.drawText(glideText, dial.toNearestInt(), juce::Justification::centred);
+        const juce::Rectangle<float> heading(x - 48.0f, y - 54.0f, 96.0f, 20.0f);
+        g.setColour(palette.cream.withAlpha(ccPopupAlpha * 0.98f));
+        g.fillRoundedRectangle(heading, 4.0f);
+        g.setColour(palette.ink.withAlpha(ccPopupAlpha));
+        g.setFont(font(11.0f, true));
+        g.drawText("GLIDE TIME", heading.toNearestInt(), juce::Justification::centred);
 
     }
 }
+
 void PolyrhythmMIDIEditor::mouseDown(const juce::MouseEvent& e)
 {
     if (!e.mods.isLeftButtonDown()) return;
-    if (e.position.y < getHeight() * 0.110f || e.position.y >= getHeight() * 0.925f) return;
+    // For events forwarded from the editable Macro label, coordinates are
+    // relative to the editor, not to the TextEditor child.
+    const auto local = e.getEventRelativeTo(this).position;
+    dragFromRow = -1;
+    dragTargetRow = -1;
+    laneDragActive = false;
+    if (processor.getExperimentalReorderEnabled() &&
+        local.y >= getHeight() * 0.110f && local.y < getHeight() * 0.925f)
+    {
+        for (int row = 7; row < lanes; ++row)
+        {
+            if (!rowVisible(row)) continue;
+            if (reorderHandle(row).contains(local))
+            {
+                dragFromRow = dragTargetRow = row;
+                laneDragOrigin = local;
+                repaint();
+                return; // No child text editor receives the event.
+            }
+        }
+    }
+    if (e.eventComponent != this) return;
+    if (local.y < getHeight() * 0.110f || local.y >= getHeight() * 0.925f) return;
     for (int row = 0; row < lanes; ++row)
     {
         if (!rowVisible(row)) continue;
         auto& l = lane[static_cast<size_t>(row)];
         if (lengthBox(row).contains(e.position))
         {
-            l.lengthDrag = true; l.startLength = l.length; l.dragOrigin = e.getPosition(); return;
+            l.lengthDrag = true; l.startLength = l.length; l.dragOrigin = e.getPosition();
+            repaint(); // Show Set Sequence Length help immediately on click-and-hold.
+            return;
         }
         if (l.page == (l.length - 1) / 16 && markerBox(row).contains(e.position))
         {
@@ -1386,18 +1740,27 @@ void PolyrhythmMIDIEditor::mouseDown(const juce::MouseEvent& e)
                 l.draggedStep = index;
                 l.dragStartValue = l.values[static_cast<size_t>(index)];
                 l.dragOrigin = e.getPosition();
-                if (row == sustainRow)
+                if (isLaneType(row, PnordeLane::Type::sustain))
                 {
                     const int newValue = l.values[index] >= 50 ? 0 : 100;
                     processor.setLaneValue(row, index, newValue);
                     l.values[index] = newValue;
                     l.valueDrag = false;
                 }
-                if (row == vibratoRow)
+                if (isLaneType(row, PnordeLane::Type::vibrato))
                     l.dragStartDepth = processor.getVibratoDepth(index);
-                if (row >= 7 && row < modRow)
+                const bool eligibleGlide = row == 6 || (row >= 7 &&
+                    (isLaneType(row, PnordeLane::Type::ccMacro) ||
+                     isLaneType(row, PnordeLane::Type::modWheel) ||
+                     isLaneType(row, PnordeLane::Type::expression) ||
+                     isLaneType(row, PnordeLane::Type::vibrato) ||
+                     isLaneType(row, PnordeLane::Type::pan)));
+                if (eligibleGlide)
                 {
-                    l.dragStartTransitionMs = processor.getCCTransitionMs(row - 7, index);
+                    const int previous = row == 6 ? processor.getAftertouchGlide(index)
+                        : isLaneType(row, PnordeLane::Type::ccMacro) ? processor.getCCTransitionMs(row-7, index)
+                        : processor.getOptionalGlide(row, index);
+                    l.dragStartTransitionMs = juce::jlimit(0, 100, previous);
                     ccPopupRow = row;
                     ccPopupStep = index;
                     ccPopupAlpha = 1.0f;
@@ -1413,41 +1776,82 @@ void PolyrhythmMIDIEditor::updateDragValue(int row, const juce::MouseEvent& e)
     auto& l = lane[static_cast<size_t>(row)];
     if (!l.valueDrag || l.draggedStep < 0) return;
     const int dy = l.dragOrigin.y - e.getPosition().y;
-    if (row >= 7 && row < modRow)
+    const bool macro = row >= 7 && isLaneType(row, PnordeLane::Type::ccMacro);
+    const bool vibrato = isLaneType(row, PnordeLane::Type::vibrato);
+    const bool pan = isLaneType(row, PnordeLane::Type::pan);
+    const bool dedicatedGlide = row >= 7 && (
+        isLaneType(row, PnordeLane::Type::modWheel) ||
+        isLaneType(row, PnordeLane::Type::expression) || vibrato || pan);
+    const int dx = e.getPosition().x - l.dragOrigin.x;
+    // PAN: left/right -> CC10 (0..127), up/down -> Glide 0..100.
+    // These two axes never influence each other.
+    // VIBRATO retains horizontal depth; Shift+horizontal adjusts glide.
+    if (row == 6 || macro || dedicatedGlide)
     {
-        // Horizontal drag: 50 ms per pixel, 200 px spans 0..10 seconds.
-        const int dx = e.getPosition().x - l.dragOrigin.x;
-        processor.setCCTransitionMs(row - 7, l.draggedStep,
-            juce::jlimit(0, 100, l.dragStartTransitionMs + juce::roundToInt(dx / 2.0f)));
+        const bool editingGlide = !vibrato || e.mods.isShiftDown();
+        if ((pan ? dy != 0 : dx != 0) && editingGlide)
+        {
+            const float glideSensitivity = e.mods.isShiftDown() ? 6.0f : 2.0f;
+            const int glideDelta = pan ? dy : dx;
+            const int glide = juce::jlimit(0, 100,
+                l.dragStartTransitionMs + juce::roundToInt(glideDelta / glideSensitivity));
+            if (row == 6) processor.setAftertouchGlide(l.draggedStep, glide);
+            else if (macro) processor.setCCTransitionMs(row-7, l.draggedStep, glide);
+            else processor.setOptionalGlide(row, l.draggedStep, glide);
+        }
         ccPopupAlpha = 1.0f;
     }
-    if (row == vibratoRow)
-    {
-        const int dx = e.getPosition().x - l.dragOrigin.x;
+    if (vibrato && !e.mods.isShiftDown())
         processor.setVibratoDepth(l.draggedStep,
-            l.dragStartDepth + juce::roundToInt(dx / (e.mods.isShiftDown() ? 8.0f : 2.5f)));
-    }
-    const float sensitivity = e.mods.isShiftDown() ? 12.0f : row == 1 && processor.getScale() == 13 ? 1.8f : 3.5f;
-    const int maximum = row == channelRow ? 16 : row == panRow ? 127 : row == 1 ? 120 : row == 4 ? 4 : 100;
+            l.dragStartDepth + juce::roundToInt(dx / 2.5f));
+    // EDO/quartertone scales need 10-cent pitch-lane movement: rounding to
+    // 12-TET semitones before quantising would make some notes unreachable.
+    const int selectedScale = processor.getScale();
+    const bool finePitch = selectedScale == 13 || selectedScale == 32 ||
+                           selectedScale == 33 || PnordeEDO::isMode(selectedScale);
+    const float sensitivity = e.mods.isShiftDown() ? 12.0f : row == 1 && finePitch ? 1.8f : 3.5f;
+    const int maximum = isLaneType(row, PnordeLane::Type::midiChannel) ? 16 : isLaneType(row, PnordeLane::Type::pan) ? 127 : row == 1 ? 120 : row == 4 ? 4 : 100;
     const int minimum = row == 1 ? -120 : row == 4 ? -4 : row >= 5 ? 0 : 1;
-    const int amount = row == panRow
-        ? juce::roundToInt((e.getPosition().x - l.dragOrigin.x) / (e.mods.isShiftDown() ? 6.0f : 2.0f))
-        : juce::roundToInt(dy / sensitivity);
+    // For Pan, a vertical-only drag cannot modify the Pan value.
+    const int amount = juce::roundToInt((pan ? dx : dy) /
+        (pan ? (e.mods.isShiftDown() ? 6.0f : 2.0f) : sensitivity));
     const int value = juce::jlimit(minimum, maximum, l.dragStartValue + amount);
-    const int adjusted = row == 1 && processor.getScale() != 13
-        ? processor.quantizePitchTenths(juce::roundToInt(value / 10.0) * 10, 0) : value;
+    const int adjusted = row == 1 && selectedScale != 13
+        ? processor.quantizePitchTenths(
+            finePitch ? value : juce::roundToInt(value/10.0)*10,0)
+        : value;
     const auto step = static_cast<size_t>(l.draggedStep);
     l.values[step] = adjusted;
     // Keep the audio engine in sync so the timer cannot reset the dragged value.
     processor.setLaneValue(row, l.draggedStep, adjusted);
     // Animate towards the new value immediately; the timer continues the easing.
-    const float targetFill = row == channelRow ? adjusted / 16.0f : row == panRow ? adjusted / 127.0f : row == 1 ? (adjusted + 120.0f) / 240.0f
+    const float targetFill = isLaneType(row, PnordeLane::Type::midiChannel) ? adjusted / 16.0f : isLaneType(row, PnordeLane::Type::pan) ? adjusted / 127.0f : row == 1 ? (adjusted + 120.0f) / 240.0f
                            : row == 4 ? (adjusted + 4.0f) / 8.0f : adjusted / 100.0f;
     l.visualFill[step] += (targetFill - l.visualFill[step]) * 0.45f;
     repaint();
 }
 void PolyrhythmMIDIEditor::mouseDrag(const juce::MouseEvent& e)
 {
+    if (dragFromRow >= 7)
+    {
+        const auto pos = e.getEventRelativeTo(this).position;
+        if (std::abs(pos.y - laneDragOrigin.y) > 8.0f)
+            laneDragActive = true;
+        if (!laneDragActive) return;
+        // Smooth scrolling of the normal viewport is retained during drag.
+        if (pos.y < getHeight() * 0.16f) targetScrollY -= getHeight() * 0.03f;
+        if (pos.y > getHeight() * 0.87f) targetScrollY += getHeight() * 0.03f;
+        float nearest = std::numeric_limits<float>::max();
+        for (int row = 7; row < lanes; ++row)
+        {
+            if (!rowVisible(row)) continue;
+            const float d = std::abs(pos.y - (rowTop(row) + getHeight() * 0.025f));
+            if (d < nearest) { nearest = d; dragTargetRow = row; }
+        }
+        repaint();
+        return;
+    }
+    if (e.eventComponent != this) return;
     for (int row = 0; row < lanes; ++row)
     {
         auto& l = lane[static_cast<size_t>(row)];
@@ -1487,11 +1891,40 @@ void PolyrhythmMIDIEditor::mouseDrag(const juce::MouseEvent& e)
 }
 void PolyrhythmMIDIEditor::mouseUp(const juce::MouseEvent&)
 {
-    // Keep the tooltip visible briefly, then fade it out in timerCallback.
-    for (auto& l : lane) { l.lengthDrag = false; l.markerDrag = false; l.numberDrag = false; l.valueDrag = false; l.draggedStep = -1; }
+    if (dragFromRow >= 7)
+    {
+        if (laneDragActive && dragTargetRow >= 7 && dragTargetRow != dragFromRow)
+        {
+            processor.moveDisplayRow(dragFromRow, dragTargetRow);
+            // Only the visual permutation changes: same physical MIDI rows,
+            // automation parameter IDs and step data remain untouched.
+            refreshMacroPlaceholders();
+            resized();
+        }
+        dragFromRow = dragTargetRow = -1;
+        laneDragActive = false;
+        repaint();
+    }
+    // Dismiss the contextual length helper immediately on mouse release,
+    // including when the host transport is stopped (no animation repaint).
+    bool dismissedLengthHelper = false;
+    for (auto& l : lane)
+    {
+        dismissedLengthHelper |= l.lengthDrag;
+        l.lengthDrag = false; l.markerDrag = false;
+        l.numberDrag = false; l.valueDrag = false; l.draggedStep = -1;
+    }
+    if (dismissedLengthHelper) repaint();
 }
 void PolyrhythmMIDIEditor::mouseMove(const juce::MouseEvent& e)
 {
+    bool overRail = false;
+    if (processor.getExperimentalReorderEnabled())
+        for (int row = 7; row < lanes; ++row)
+            if (rowVisible(row) && reorderHandle(row).contains(e.position))
+                { overRail = true; break; }
+    setMouseCursor(overRail ? juce::MouseCursor::DraggingHandCursor
+                            : juce::MouseCursor::NormalCursor);
     for (int row = 0; row < lanes; ++row)
     {
         auto& l = lane[static_cast<size_t>(row)];
@@ -1510,6 +1943,7 @@ void PolyrhythmMIDIEditor::mouseMove(const juce::MouseEvent& e)
 }
 void PolyrhythmMIDIEditor::mouseExit(const juce::MouseEvent&)
 {
+    setMouseCursor(juce::MouseCursor::NormalCursor);
     for (auto& l : lane) l.hovered = -1;
     repaint();
 }
@@ -1525,11 +1959,12 @@ void PolyrhythmMIDIEditor::mouseDoubleClick(const juce::MouseEvent& e)
             if (step >= processor.getLaneLength(row) || !cell(row, i).contains(e.position))
                 continue;
             if (row == 0) return; // Note on/off is a toggle, not a value slider.
-            const int reset = row == 2 ? 70 : row == 3 ? 50 : row == panRow ? 64 : 0;
+            const int reset = row == 2 ? 70 : row == 3 ? 50 : isLaneType(row, PnordeLane::Type::pan) ? 64 : 0;
             processor.setLaneValue(row, step, reset);
-            if (row >= 7 && row < modRow)
+            if (row >= 7 && isLaneType(row, PnordeLane::Type::ccMacro))
                 processor.setCCTransitionMs(row - 7, step, 0);
-            if (row == vibratoRow) processor.setVibratoDepth(step, 0);
+            if (row == 6) processor.setAftertouchGlide(step, 0);
+            if (isLaneType(row, PnordeLane::Type::vibrato)) processor.setVibratoDepth(step, 0);
             lane[row].values[step] = reset;
             repaint();
             return;
@@ -1540,6 +1975,9 @@ void PolyrhythmMIDIEditor::timerCallback()
 {
     const bool playing = processor.isHostPlaying();
     const bool animate = processor.getAnimationsEnabled();
+    const bool experimentalLights = processor.getExperimentalLightsEnabled();
+    const int desiredHz = experimentalLights ? 30 : 24;
+    if (animationTimerHz != desiredHz) { animationTimerHz = desiredHz; startTimerHz(desiredHz); }
     const double nowMs = juce::Time::getMillisecondCounterHiRes();
     const double sampleMs = processor.getHostClockUpdateMs();
     const double extrapolateMs = playing && sampleMs > 0.0
@@ -1553,32 +1991,20 @@ void PolyrhythmMIDIEditor::timerCallback()
     const double globalFactor = globalFactors[juce::jlimit(0, 4,
         processor.getGlobalClockIndex())];
 
-    // Global footer lights use the global step duration, not the UI timer.
-    // 45 degrees = one eighth of a complete pulse cycle.
-    if (playing && animate)
-    {
-        const double beats = 0.5 * globalFactor;
-        const double cycles = ppqNow / juce::jmax(0.00001, beats);
-        const double frac = cycles - std::floor(cycles);
-        globalStepPhase = static_cast<float>(frac);
-        globalLed = PnordeLights::pulse(frac * beats * 60000.0 / bpm,
-                                        beats * 60000.0 / bpm);
-    }
-    else
-    {
-        globalStepPhase = 0.0f;
-        globalLed = 0.0f;
-    }
+    // The lane clock phases are computed below only for visible rows.
 
     bool shouldRepaint = (playing != lastTransportPlaying);
     bool fullRepaint = shouldRepaint;
     lastTransportPlaying = playing;
-    if (animate && playing) { pulse += 0.14; shouldRepaint = true; }
+    if (animate && playing && experimentalLights) { pulse += 0.14; shouldRepaint = true; }
     if (scrollbarOpacity > 0.01f) {
         scrollbarOpacity *= 0.91f;
         shouldRepaint = true;
     }
-    if (ccPopupRow >= 7 && ccPopupRow < modRow &&
+    if (ccPopupRow >= 6 && ccPopupRow < lanes &&
+        (ccPopupRow == 6 || (ccPopupRow >= 7 &&
+         !isLaneType(ccPopupRow, PnordeLane::Type::sustain) &&
+         !isLaneType(ccPopupRow, PnordeLane::Type::midiChannel))) &&
         !lane[static_cast<size_t>(ccPopupRow)].valueDrag)
     {
         ccPopupAlpha = juce::jmax(0.0f, ccPopupAlpha - 0.075f);
@@ -1620,13 +2046,37 @@ void PolyrhythmMIDIEditor::timerCallback()
         shouldRepaint = true;
         fullRepaint = true;
     }
+    manualTempoToggle.setToggleState(processor.getManualTempoEnabled(), juce::dontSendNotification);
+    manualTempoInput.setEnabled(processor.getManualTempoEnabled());
+    if (!manualTempoInput.hasKeyboardFocus(true))
+    {
+        const auto bpmText = juce::String(processor.getManualTempoBpm(), 1);
+        if (manualTempoInput.getText() != bpmText)
+            manualTempoInput.setText(bpmText, false);
+    }
+    octaveDial.setIndex(processor.getGlobalOctave()+2);
+    keyDial.setIndex(processor.getKey());
+    scaleDial.setIndex(processor.getScale());
+    globalClockDial.setIndex(processor.getGlobalClockIndex());
+    for (int row = 0; row < lanes; ++row)
+        if (rowVisible(row))
+        {
+            clockDials[row].setValue(processor.getLaneDivision(row));
+            timingDials[row].setValue(processor.getLaneTiming(row));
+        }
     if (globalClockSelect.getSelectedId() != processor.getGlobalClockIndex() + 1)
         globalClockSelect.setSelectedId(processor.getGlobalClockIndex() + 1, juce::dontSendNotification);
-    if (bendRangeSelect.getSelectedId() != processor.getBendRangeIndex() + 1)
-        bendRangeSelect.setSelectedId(processor.getBendRangeIndex() + 1, juce::dontSendNotification);
-    if (keySelect.getSelectedId() != processor.getKey() + 1)
+    const int effectiveBendId = processor.getEffectiveBendRangeIndex() + 1;
+    if (bendRangeSelect.getSelectedId() != effectiveBendId)
+        bendRangeSelect.setSelectedId(effectiveBendId, juce::dontSendNotification);
+    const bool bendEditable = !processor.isMicrotonalScaleSelected();
+    if (bendRangeSelect.isEnabled() != bendEditable)
+        bendRangeSelect.setEnabled(bendEditable);
+    // Never change a ComboBox selection while its popup is open: doing so
+    // can cancel the user's first click on Key/Scale under some hosts.
+    if (!keySelect.isPopupActive() && keySelect.getSelectedId() != processor.getKey() + 1)
         keySelect.setSelectedId(processor.getKey() + 1, juce::dontSendNotification);
-    if (scaleSelect.getSelectedId() != processor.getScale() + 1)
+    if (!scaleSelect.isPopupActive() && scaleSelect.getSelectedId() != processor.getScale() + 1)
         scaleSelect.setSelectedId(processor.getScale() + 1, juce::dontSendNotification);
 
     // Work only on visible rows and on their current 16-step page. Previously
@@ -1647,14 +2097,20 @@ void PolyrhythmMIDIEditor::timerCallback()
         const int first = juce::jlimit(0, 112, l.page * 16);
         for (int i = first; i < first + visibleSteps; ++i)
         {
+            // The currently playing step remains highlighted; previous steps
+            // fade smoothly to their constant idle backlight, in both modes.
+            const float previous = l.rangeOpacity[i];
+            const float activity = (playing && i == l.activeStep) ? 1.0f : previous * 0.76f;
+            l.rangeOpacity[i] = activity < 0.012f ? 0.0f : activity;
+            if (std::abs(previous - l.rangeOpacity[i]) > 0.012f) shouldRepaint = true;
             const int value = processor.getLaneValue(row, i);
             if (l.values[i] != value) { l.values[i] = value; shouldRepaint = true; }
-            const float targetFill = row == channelRow ? value / 16.0f
-                : row == panRow ? value / 127.0f
+            const float targetFill = isLaneType(row, PnordeLane::Type::midiChannel) ? value / 16.0f
+                : isLaneType(row, PnordeLane::Type::pan) ? value / 127.0f
                 : row == 1 ? (value + 120.0f) / 240.0f
                 : row == 4 ? (value + 4.0f) / 8.0f
                 : value / 100.0f;
-            if (!animate || !playing)
+            if (!animate || !playing || !experimentalLights)
                 l.visualFill[i] = targetFill;
             else if (std::abs(targetFill - l.visualFill[i]) > 0.001f)
             {
@@ -1662,7 +2118,7 @@ void PolyrhythmMIDIEditor::timerCallback()
                 shouldRepaint = true;
             }
         }
-        if (playing && animate)
+        if (playing && animate && experimentalLights)
         {
             const double durationBeats = divisionsBeats[juce::jlimit(0, 10, l.division)]
                 * globalFactor * timeFactors[juce::jlimit(0, 2, processor.getLaneTiming(row))];
@@ -1704,13 +2160,9 @@ void PolyrhythmMIDIEditor::timerCallback()
         }
         else
         {
-            // Repaint only the animated viewport rows and the title flash.
-            // Only the narrow footer band is animated for footer lighting;
-            // the remaining editor stays on the existing partial repaint path.
+            // No per-frame header/footer repaints: both are now static.
+            // On transport/theme/layout changes the full repaint path runs.
             const float h = static_cast<float>(getHeight());
-            repaint(0, 0, getWidth(), juce::roundToInt(h * 0.108f));
-            repaint(0, juce::roundToInt(h * 0.924f), getWidth(),
-                    getHeight() - juce::roundToInt(h * 0.924f));
             for (int row = 0; row < lanes; ++row)
             {
                 if (!rowVisible(row)) continue;
@@ -1731,21 +2183,6 @@ void PolyrhythmMIDIEditor::timerCallback()
     }
 }
 
-void PolyrhythmMIDIEditor::addMacroOfType(int type)
-{
-    const int slot = processor.getCustomCCCount();
-    if (slot >= 8) return;
-    processor.setMacroType(slot, type);
-    processor.setMacroChannel(slot, 0);
-    processor.setCustomCCLabel(slot, "Macro " + juce::String(slot + 1));
-    processor.setCustomCCCount(slot + 1);
-    committedCCLabels[slot] = processor.getCustomCCLabel(slot);
-    ccLabelEditors[slot].setText(committedCCLabels[slot], false);
-    syncCCVisibility();
-    targetScrollY = maxScroll();
-    resized(); repaint();
-}
-
 float PolyrhythmMIDIEditor::maxScroll() const
 {
     const float h = static_cast<float>(getHeight());
@@ -1757,47 +2194,129 @@ void PolyrhythmMIDIEditor::syncCCVisibility()
     for (int row = 0; row < lanes; ++row)
     {
         const bool visible = rowVisible(row);
-        divisions[row].setVisible(visible);
-        timings[row].setVisible(visible);
+        divisions[row].setVisible(false);
+        timings[row].setVisible(false);
+        clockDials[row].setVisible(visible);
+        timingDials[row].setVisible(visible);
         prev[row].setVisible(visible);
         next[row].setVisible(visible);
         addPage[row].setVisible(visible);
         removePage[row].setVisible(visible);
-        if (row >= 7 && row < modRow)
+        if (row >= 7)
         {
             const int slot = row - 7;
-            ccSelect[slot].setVisible(visible);
-            ccLabelEditors[slot].setVisible(visible);
+            const bool macro = isLaneType(row, PnordeLane::Type::ccMacro);
             deleteCC[slot].setVisible(visible);
+            laneTypeSelect[slot].setVisible(visible);
+            laneTypeSelect[slot].setSelectedId(processor.getOptionalLaneType(row) + 1,
+                                                 juce::dontSendNotification);
+            ccSelect[slot].setVisible(visible && macro);
+            ccLabelEditors[slot].setVisible(visible && macro);
         }
-        if (row >= modRow && row < channelRow)
-            deleteDedicated[row - modRow].setVisible(visible);
     }
-    deleteChannelButton.setVisible(processor.hasMidiChannelLane());
-    addCCButton.setEnabled(processor.getCustomCCCount() < 8 ||
-        !processor.hasMidiChannelLane() ||
-        !processor.isDedicatedEnabled(modRow) || !processor.isDedicatedEnabled(expressionRow) ||
-        !processor.isDedicatedEnabled(vibratoRow) || !processor.isDedicatedEnabled(panRow) ||
-        !processor.isDedicatedEnabled(sustainRow));
+    refreshMacroPlaceholders();
+    bool hasCapacity = processor.activeCCMacroCount() < 8;
+    for (int kind = 1; kind <= 6; ++kind)
+        if (!processor.hasActiveLaneType(kind)) hasCapacity = true;
+    addCCButton.setEnabled(hasCapacity);
+}
+
+void PolyrhythmMIDIEditor::refreshMacroPlaceholders()
+{
+    int ordinal = 0;
+    const auto textColour = themes[juce::jlimit(0, themeCount - 1, themeIndex)].ink;
+    for (int pos = 0; pos < optionalLanes; ++pos)
+    {
+        const int row = processor.getDisplayRowAt(pos);
+        if (!rowVisible(row) || !isLaneType(row, PnordeLane::Type::ccMacro)) continue;
+        ccLabelEditors[static_cast<size_t>(row - 7)].setTextToShowWhenEmpty(
+            "MACRO " + juce::String(++ordinal), textColour.withAlpha(0.92f));
+    }
 }
 
 void PolyrhythmMIDIEditor::applyTooltips()
 {
     const bool enabled = processor.getTooltipsEnabled();
-    for (int slot = 0; slot < 8; ++slot)
+    const auto hint = [enabled](const char* value) -> juce::String
+        { return enabled ? juce::String(value) : juce::String(); };
+    for (auto* d : { &octaveDial, &keyDial, &scaleDial, &globalClockDial }) d->setTooltipsEnabled(enabled);
+    for (auto& dial : clockDials) dial.setTooltipsEnabled(enabled);
+    for (auto& dial : timingDials) dial.setTooltipsEnabled(enabled);
+    for (int slot = 0; slot < optionalLanes; ++slot)
     {
-        ccLabelEditors[slot].setTooltip(enabled ? "Rename this Macro lane. Press Enter to save." : "");
-        ccSelect[slot].setTooltip(enabled ? "Choose the MIDI CC number for this Macro." : "");
+        ccLabelEditors[slot].setTooltip(hint("Rename CC Macro. Enter saves; Escape cancels."));
+        ccSelect[slot].setTooltip(hint("Choose the MIDI controller (CC20 to CC31) sent by this Macro."));
+        laneTypeSelect[slot].setTooltip(hint("Change this lane's MIDI function. Existing step values are preserved."));
+        deleteCC[slot].setTooltip(hint("Remove this optional lane."));
     }
     for (int row = 0; row < lanes; ++row)
-        divisions[row].setTooltip(enabled ? "Lane clock division. Double-click to reset." : "");
-    globalClockSelect.setTooltip(enabled ? "Global clock multiplier. Double-click to reset to 1x." : "");
-    addCCButton.setTooltip(enabled ? "Add up to eight Macros or one of each dedicated MIDI lane." : "");
-    settingsButton.setTooltip(enabled ? "Open PNORDE settings." : "");
-    savePresetButton.setTooltip(enabled ? "Save every pattern and setting as a .pnorde preset." : "");
-    loadPresetButton.setTooltip(enabled ? "Load a .pnorde preset." : "");
-    randomiseButton.setTooltip(enabled ? "Randomise only active steps in the selected lane or all lanes." : "");
-    presetFolderButton.setTooltip(enabled ? "Open or choose a preset library folder." : "");
+    {
+        divisions[row].setTooltip(hint("Clock division for this lane. Double-click to reset."));
+        timings[row].setTooltip(hint("Choose straight, triplet or dotted timing for this lane."));
+        prev[row].setTooltip(hint("Previous page: show the preceding 16 steps."));
+        next[row].setTooltip(hint("Next page: show the next 16 steps."));
+        addPage[row].setTooltip(hint("Add page: append 16 steps to this lane, up to 128."));
+        removePage[row].setTooltip(hint("Remove page: delete this page of steps (minimum 16)."));
+    }
+    keySelect.setTooltip(hint("Select the root key used for pitch quantisation."));
+    scaleSelect.setTooltip(hint("Select the pitch scale for this sequence."));
+    midiOutputSelect.setTooltip(hint("Choose Ableton host MIDI or a MIDI output device."));
+    refreshMidiOutputs.setTooltip(hint("Refresh the available MIDI output devices."));
+    themeSelect.setTooltip(hint("Choose PNORDE's colour theme."));
+    bendRangeSelect.setTooltip(hint("Microtonal scales force +/-2 semitones; match the receiving synth. For standard scales, choose your preferred range."));
+    globalClockSelect.setTooltip(hint("Global clock multiplier. Double-click to reset to 1x."));
+    addCCButton.setTooltip(hint("Add a CC Macro or one of each dedicated MIDI lane."));
+    settingsButton.setTooltip(hint("Open PNORDE settings."));
+    savePresetButton.setTooltip(hint("Save every pattern and setting as a .pnorde preset."));
+    loadPresetButton.setTooltip(hint("Load a .pnorde preset."));
+    randomiseButton.setTooltip(hint("Randomise lanes or generate a harmonic microtonal PITCH pattern when an EDO mode is selected."));
+    presetFolderButton.setTooltip(hint("Open or choose the preset library folder."));
+}
+
+juce::String PolyrhythmMIDIEditor::getTooltip()
+{
+    if (!processor.getTooltipsEnabled()) return {};
+    const auto point = getMouseXYRelative().toFloat();
+    const float h = static_cast<float>(getHeight());
+    if (point.y < h * 0.110f || point.y >= h * 0.925f) return {};
+    for (int row = 0; row < lanes; ++row)
+    {
+        if (!rowVisible(row)) continue;
+        if (row >= 7 && reorderHandle(row).contains(point))
+            return processor.getExperimentalReorderEnabled()
+                ? "Drag the coloured rail to reorder this lane."
+                : "Lane clock indicator. Enable Experimental Reorder in Settings to drag.";
+        if (lengthBox(row).contains(point))
+            return "Set Sequence Length: drag to change; double-click to reset to 16.";
+        if (lane[row].page == (lane[row].length - 1) / visibleSteps && markerBox(row).contains(point))
+            return "Drag the sequence end marker to set the number of steps.";
+        for (int i = 0; i < visibleSteps; ++i)
+        {
+            const auto b = cell(row, i);
+            const juce::Rectangle<float> numberHit(b.getX(), rowTop(row) + h * 0.027f,
+                                                      b.getWidth(), h * 0.023f);
+            if (numberHit.contains(point))
+                return "Click or drag a step number to set the sequence length.";
+            if (!b.contains(point) || lane[row].page * visibleSteps + i >= lane[row].length)
+                continue;
+            if (row == 0) return "Click to enable or disable this note gate.";
+            if (row == 5 && processor.isMicrotonalScaleSelected())
+                return "Pitch Approach: 0% instant, 100% takes the sounding gate duration (tempo-relative). Drag vertically.";
+            if (row == 6) return "Drag vertically for Aftertouch; horizontally for Glide Time.";
+            if (isLaneType(row, PnordeLane::Type::ccMacro))
+                return "Drag vertically for CC value; horizontally for CC glide.";
+            if (isLaneType(row, PnordeLane::Type::vibrato))
+                return "Drag vertically for Vibrato rate; horizontally for depth.";
+            if (isLaneType(row, PnordeLane::Type::sustain))
+                return "Click to toggle the Sustain pedal.";
+            if (isLaneType(row, PnordeLane::Type::pan))
+                return "Pan: left/right changes CC10 (L / C / R); up/down changes glide time. Shift = fine.";
+            if (isLaneType(row, PnordeLane::Type::midiChannel))
+                return "Drag vertically to select MIDI channel; D uses the default.";
+            return "Drag vertically to set this step's value. Shift gives finer control.";
+        }
+    }
+    return {};
 }
 
 void PolyrhythmMIDIEditor::showSettingsMenu()
@@ -1819,21 +2338,40 @@ void PolyrhythmMIDIEditor::showSettingsMenu()
             safe->applyTooltips();
             safe->repaint();
         });
-    juce::CallOutBox::launchAsynchronously(std::move(panel),
-        settingsButton.getScreenBounds(), this);
+    auto& box = juce::CallOutBox::launchAsynchronously(std::move(panel),
+        settingsButton.getBounds(), this);
+    settingsCallout = &box;
+    box.setDismissalMouseClicksAreAlwaysConsumed(true);
 }
 
 void PolyrhythmMIDIEditor::syncFromProcessor()
 {
     themeIndex = juce::jlimit(0, themeCount - 1, processor.getThemeIndex());
+    ccPopupRow = -1; ccPopupAlpha = 0.0f;
+    dragFromRow = dragTargetRow = -1; laneDragActive = false;
     themeSelect.setSelectedId(themeIndex + 1, juce::dontSendNotification);
     keySelect.setSelectedId(processor.getKey() + 1, juce::dontSendNotification);
     scaleSelect.setSelectedId(processor.getScale() + 1, juce::dontSendNotification);
-    bendRangeSelect.setSelectedId(processor.getBendRangeIndex() + 1, juce::dontSendNotification);
+    bendRangeSelect.setSelectedId(processor.getEffectiveBendRangeIndex() + 1, juce::dontSendNotification);
+    bendRangeSelect.setEnabled(!processor.isMicrotonalScaleSelected());
     globalClockSelect.setSelectedId(processor.getGlobalClockIndex() + 1, juce::dontSendNotification);
     darknessSlider.setValue(processor.getDarknessPercent(), juce::dontSendNotification);
-    for (int slot = 0; slot < 8; ++slot)
+    manualTempoToggle.setToggleState(processor.getManualTempoEnabled(), juce::dontSendNotification);
+    manualTempoInput.setEnabled(processor.getManualTempoEnabled());
+    if (!manualTempoInput.hasKeyboardFocus(true))
     {
+        const auto bpmText = juce::String(processor.getManualTempoBpm(), 1);
+        if (manualTempoInput.getText() != bpmText)
+            manualTempoInput.setText(bpmText, false);
+    }
+    octaveDial.setIndex(processor.getGlobalOctave()+2);
+    keyDial.setIndex(processor.getKey());
+    scaleDial.setIndex(processor.getScale());
+    globalClockDial.setIndex(processor.getGlobalClockIndex());
+    for (int slot = 0; slot < optionalLanes; ++slot)
+    {
+        laneTypeSelect[slot].setSelectedId(processor.getOptionalLaneType(slot + 7) + 1,
+                                          juce::dontSendNotification);
         ccSelect[slot].setSelectedId(processor.getCustomCCNumber(slot) + 1,
                                      juce::dontSendNotification);
         committedCCLabels[slot] = processor.getCustomCCLabel(slot);
@@ -1851,12 +2389,14 @@ void PolyrhythmMIDIEditor::syncFromProcessor()
         divisions[row].setSelectedId(l.division + 1, juce::dontSendNotification);
         timings[row].setSelectedId(processor.getLaneTiming(row) + 1,
                                    juce::dontSendNotification);
+        clockDials[row].setValue(l.division);
+        timingDials[row].setValue(processor.getLaneTiming(row));
         for (int i = 0; i < 128; ++i)
         {
             const int v = processor.getLaneValue(row, i);
             l.values[i] = v;
-            l.visualFill[i] = row == channelRow ? v / 16.0f
-                : row == panRow ? v / 127.0f
+            l.visualFill[i] = isLaneType(row, PnordeLane::Type::midiChannel) ? v / 16.0f
+                : isLaneType(row, PnordeLane::Type::pan) ? v / 127.0f
                 : row == 1 ? (v + 120.0f) / 240.0f
                 : row == 4 ? (v + 4.0f) / 8.0f : v / 100.0f;
         }
@@ -2013,11 +2553,36 @@ void PolyrhythmMIDIEditor::randomisePattern()
     menu.addItem(1, "Randomise all active lanes");
     menu.addItem(2, "Randomise SEQ gate pattern only");
     menu.addSeparator();
+    // Four researched mood-oriented patterns use curated EDO scale degrees.
+    // They only replace the PITCH lane; existing gates and other lanes survive.
+    juce::PopupMenu edoGenerator;
+    for (int i=0; i<PnordeEDO::moodCount; ++i)
+        edoGenerator.addItem(300+i,PnordeEDO::moodNames[i]);
+    menu.addSubMenu("Generate melody - selected EDO (PITCH)", edoGenerator,
+                    PnordeEDO::isMode(processor.getScale()));
+    // Pick any EDO AND a mood in one menu action. This is a deliberate
+    // scale change, labelled explicitly to avoid surprising users.
+    juce::PopupMenu modes;
+    for (int edo=0; edo<PnordeEDO::modeCount; ++edo)
+    {
+        juce::PopupMenu moods;
+        for (int mood=0; mood<PnordeEDO::moodCount; ++mood)
+            moods.addItem(1000+edo*16+mood, PnordeEDO::moodNames[mood]);
+        modes.addSubMenu(PnordeEDO::modes[static_cast<size_t>(edo)].name, moods);
+    }
+    menu.addSubMenu("Choose EDO + generate PITCH", modes);
+    juce::PopupMenu gateRecipes, velocityRecipes;
+    for (int i=0; i<PnordePatternLibrary::gateCount; ++i)
+        gateRecipes.addItem(500+i, PnordePatternLibrary::gateNames[i]);
+    for (int i=0; i<PnordePatternLibrary::velocityCount; ++i)
+        velocityRecipes.addItem(600+i, PnordePatternLibrary::velocityNames[i]);
+    menu.addSubMenu("Generate GATE rhythm", gateRecipes);
+    menu.addSubMenu("Generate VELOCITY groove", velocityRecipes);
+    menu.addSeparator();
     for (int row = 0; row < lanes; ++row)
     {
         if (!rowVisible(row)) continue;
-        const juce::String title = row >= 7 && row < modRow
-            ? processor.getCustomCCLabel(row - 7) : juce::String(names[row]);
+        const juce::String title = laneDisplayName(row);
         menu.addItem(100 + row, "Randomise " + title);
     }
     juce::Component::SafePointer<PolyrhythmMIDIEditor> safe(this);
@@ -2048,15 +2613,62 @@ void PolyrhythmMIDIEditor::randomisePattern()
                     else if (row == 4) value = rng.nextInt(5) - 2;
                     else if (row == 5) value = rng.nextInt(101);
                     else if (row == 6) value = rng.nextInt(91);
-                    else if (row == panRow) value = 24 + rng.nextInt(81);
-                    else if (row == sustainRow) value = rng.nextBool() ? 100 : 0;
-                    else if (row == channelRow) value = rng.nextInt(17);
+                    else if (safe->isLaneType(row, PnordeLane::Type::pan)) value = 24 + rng.nextInt(81);
+                    else if (safe->isLaneType(row, PnordeLane::Type::sustain)) value = rng.nextBool() ? 100 : 0;
+                    else if (safe->isLaneType(row, PnordeLane::Type::midiChannel)) value = rng.nextInt(17);
                     else value = rng.nextInt(101);
                     engine.setLaneValue(row, step, value);
-                    if (row == vibratoRow)
+                    if (safe->isLaneType(row, PnordeLane::Type::vibrato))
                         engine.setVibratoDepth(step, rng.nextInt(101));
                 }
             };
+            if (id >= 500 && id < 500+PnordePatternLibrary::gateCount)
+            {
+                std::array<bool,128> pattern{};
+                const int count=juce::jlimit(1,128,engine.getLaneLength(0));
+                PnordePatternLibrary::gates(pattern,count,id-500,
+                    static_cast<std::uint32_t>(rng.nextInt()));
+                for (int step=0; step<count; ++step) engine.setStepEnabled(step,pattern[static_cast<size_t>(step)]);
+                safe->syncFromProcessor();
+                return;
+            }
+            if (id >= 600 && id < 600+PnordePatternLibrary::velocityCount)
+            {
+                std::array<int,128> values{};
+                const int count=juce::jlimit(1,128,engine.getLaneLength(2));
+                PnordePatternLibrary::velocities(values,count,id-600,
+                    static_cast<std::uint32_t>(rng.nextInt()));
+                for (int step=0; step<count; ++step) engine.setLaneValue(2,step,values[static_cast<size_t>(step)]);
+                safe->syncFromProcessor();
+                return;
+            }
+            if (id >= 1000 && id < 1000+PnordeEDO::modeCount*16)
+            {
+                const int slot=(id-1000)/16;
+                const int mood=(id-1000)%16;
+                if (mood>=PnordeEDO::moodCount) return;
+                engine.setScale(PnordeEDO::firstScaleIndex+slot);
+                std::array<int,128> pitches{};
+                const int count=juce::jlimit(1,128,engine.getLaneLength(1));
+                PnordeEDO::generate(pitches,count,engine.getKey(),engine.getScale(),
+                    static_cast<PnordeEDO::Mood>(mood), static_cast<std::uint32_t>(rng.nextInt()));
+                for (int step=0; step<count; ++step) engine.setLaneValue(1,step,pitches[static_cast<size_t>(step)]);
+                safe->syncFromProcessor();
+                return;
+            }
+            if (id >= 300 && id < 300+PnordeEDO::moodCount)
+            {
+                if (!PnordeEDO::isMode(engine.getScale())) return;
+                std::array<int,128> pitches{};
+                const int count = juce::jlimit(1,128,engine.getLaneLength(1));
+                PnordeEDO::generate(pitches,count,engine.getKey(),engine.getScale(),
+                    static_cast<PnordeEDO::Mood>(id-300),
+                    static_cast<std::uint32_t>(rng.nextInt()));
+                for (int step=0; step<count; ++step)
+                    engine.setLaneValue(1,step,pitches[static_cast<size_t>(step)]);
+                safe->syncFromProcessor();
+                return;
+            }
             if (id == 1)
             {
                 for (int row = 0; row < lanes; ++row)
@@ -2090,47 +2702,88 @@ PolyrhythmMIDIEditor::~PolyrhythmMIDIEditor()
 void PolyrhythmMIDIEditor::applyTheme()
 {
     const auto& t = themes[themeIndex];
+    const bool dark = t.paper.getPerceivedBrightness() < 0.50f;
+    const auto tooltipBackground = dark ? juce::Colour(0xff24334A) : juce::Colour(0xfffff4db);
+    const auto tooltipText = dark ? juce::Colour(0xfff7f1ea) : juce::Colour(0xff20283A);
+    tooltipWindow.setColour(juce::TooltipWindow::backgroundColourId, tooltipBackground);
+    tooltipWindow.setColour(juce::TooltipWindow::textColourId, tooltipText);
+    tooltipWindow.setColour(juce::TooltipWindow::outlineColourId, t.teal);
+    // Ensures the standard tooltip is drawn as a fully opaque foreground window.
+    tooltipWindow.setOpaque(true);
+    // Brighter but steady controls. Unlike the lane rail, these never pulse.
+    // Backlit controls are brighter than v0.5.5 but remain STATIC.
+    // A moderate blend raises dark-theme background luminance without
+    // sacrificing legibility of the light foreground text.
+    const auto controlBg = dark ? t.cream.interpolatedWith(t.ink, 0.33f) : t.cream;
+    const auto controlInk = t.ink;
     for (auto* box : std::array<juce::ComboBox*, 4>{ { &keySelect, &scaleSelect, &globalClockSelect, &bendRangeSelect } })
     {
-        box->setColour(juce::ComboBox::backgroundColourId, t.paper);
-        box->setColour(juce::ComboBox::textColourId, t.ink);
-        box->setColour(juce::ComboBox::arrowColourId, t.ink);
+        box->setColour(juce::ComboBox::backgroundColourId, controlBg);
+        box->setColour(juce::ComboBox::textColourId, controlInk);
+        box->setColour(juce::ComboBox::arrowColourId, controlInk);
     }
+    for (auto* dial : { &octaveDial, &keyDial, &scaleDial, &globalClockDial })
+        dial->setPalette(t.paper, t.ink, t.teal);
+    const juce::Colour laneColours[] {t.coral,t.blue,t.sage,t.lavender,t.amber,t.teal,t.pink,
+        t.teal,t.amber,t.blue,t.coral,t.lavender,t.sage,t.pink,t.amber,t.teal,t.blue,t.lavender,t.pink,t.sage,t.amber};
     for (int row = 0; row < lanes; ++row)
     {
-        const juce::Colour c[] {t.coral,t.blue,t.sage,t.lavender,t.amber,t.teal,t.pink,t.teal,t.amber,t.blue,t.coral,t.lavender,t.sage,t.pink,t.amber,t.teal,t.blue,t.lavender,t.pink,t.sage,t.amber};
+        clockDials[row].setPalette(t.paper, controlInk, laneColours[row]);
+        timingDials[row].setPalette(t.paper, controlInk, laneColours[row]);
         for (auto* box : std::array<juce::ComboBox*, 2>{ { &divisions[row], &timings[row] } })
         {
-            box->setColour(juce::ComboBox::backgroundColourId, t.paper);
-            box->setColour(juce::ComboBox::textColourId, t.ink);
-            box->setColour(juce::ComboBox::arrowColourId, t.ink);
+            box->setColour(juce::ComboBox::backgroundColourId, controlBg);
+            box->setColour(juce::ComboBox::textColourId, controlInk);
+            box->setColour(juce::ComboBox::arrowColourId, controlInk);
         }
-        divisions[row].setColour(juce::ComboBox::outlineColourId, c[row]);
-        for (auto* button : {&prev[row], &next[row]})
+        divisions[row].setColour(juce::ComboBox::outlineColourId, t.ink.withAlpha(dark ? 0.60f : 0.33f));
+        timings[row].setColour(juce::ComboBox::outlineColourId, t.ink.withAlpha(dark ? 0.60f : 0.33f));
+        for (auto* button : {&prev[row], &next[row], &addPage[row], &removePage[row]})
         {
-            button->setColour(juce::TextButton::buttonColourId, t.paper);
-            button->setColour(juce::TextButton::textColourOffId, t.ink);
+            button->setColour(juce::TextButton::buttonColourId,
+                dark ? t.cream.interpolatedWith(t.ink, 0.16f) : t.paper);
+            button->setColour(juce::TextButton::buttonOnColourId, laneColours[row]);
+            button->setColour(juce::TextButton::textColourOffId,
+                dark ? laneColours[row].brighter(0.85f) : laneColours[row].darker(0.20f));
         }
+        removePage[row].setWarning(true);
     }
-    for (int slot = 0; slot < 8; ++slot)
+    for (int slot = 0; slot < optionalLanes; ++slot)
     {
-        ccSelect[slot].setColour(juce::ComboBox::backgroundColourId, t.paper);
+        ccSelect[slot].setColour(juce::ComboBox::backgroundColourId, controlBg);
         ccSelect[slot].setColour(juce::ComboBox::textColourId, t.ink);
         ccSelect[slot].setColour(juce::ComboBox::arrowColourId, t.ink);
+        laneTypeSelect[slot].setColour(juce::ComboBox::backgroundColourId, controlBg);
+        laneTypeSelect[slot].setColour(juce::ComboBox::textColourId, t.ink);
+        laneTypeSelect[slot].setColour(juce::ComboBox::arrowColourId, t.ink);
+        for (auto* cb : { &ccSelect[slot], &laneTypeSelect[slot] })
+            cb->setColour(juce::ComboBox::outlineColourId,
+                          t.ink.withAlpha(dark ? 0.60f : 0.33f));
+        deleteCC[slot].setColour(juce::TextButton::buttonColourId, controlBg);
+        deleteCC[slot].setColour(juce::TextButton::textColourOffId, dark ? t.ink : t.coral);
         auto& editor = ccLabelEditors[slot];
-        editor.setColour(juce::TextEditor::textColourId, t.ink);
-        editor.setColour(juce::TextEditor::highlightedTextColourId, t.ink);
+        editor.setColour(juce::TextEditor::backgroundColourId, t.paper);
+        editor.setColour(juce::TextEditor::textColourId, laneColours[slot+7].brighter(dark ? 0.72f : 0.12f));
+        editor.setColour(juce::TextEditor::highlightedTextColourId,
+                         laneColours[slot+7].brighter(dark ? 0.72f : 0.12f));
         editor.setColour(juce::TextEditor::focusedOutlineColourId, t.teal);
         editor.setColour(juce::TextEditor::highlightColourId, t.teal.withAlpha(0.28f));
     }
     addCCButton.setColour(juce::TextButton::buttonColourId, t.teal);
     addCCButton.setColour(juce::TextButton::textColourOffId, t.ink);
-    for (auto* b : {&savePresetButton, &loadPresetButton, &presetFolderButton,
-                    &randomiseButton, &settingsButton})
+    for (auto* b : std::array<juce::TextButton*, 5>{ {
+        &savePresetButton, &loadPresetButton, &presetFolderButton,
+        &randomiseButton, &settingsButton } })
     {
         b->setColour(juce::TextButton::buttonColourId, t.paper);
         b->setColour(juce::TextButton::textColourOffId, t.ink);
     }
+    manualTempoToggle.setColour(juce::ToggleButton::textColourId, t.teal);
+    manualTempoToggle.setColour(juce::ToggleButton::tickColourId, t.teal);
+    manualTempoInput.setColour(juce::TextEditor::backgroundColourId,
+                               dark ? t.cream.interpolatedWith(t.ink, 0.25f) : t.cream);
+    manualTempoInput.setColour(juce::TextEditor::textColourId, t.ink);
+    manualTempoInput.setColour(juce::TextEditor::outlineColourId, t.teal.withAlpha(0.45f));
     midiOutputSelect.setColour(juce::ComboBox::backgroundColourId, t.paper);
     midiOutputSelect.setColour(juce::ComboBox::textColourId, t.ink);
     midiOutputSelect.setColour(juce::ComboBox::arrowColourId, t.ink);
@@ -2143,6 +2796,7 @@ void PolyrhythmMIDIEditor::applyTheme()
     themeSelect.setColour(juce::ComboBox::outlineColourId, t.teal);
     settingsButton.setColour(juce::TextButton::buttonColourId, t.paper);
     settingsButton.setColour(juce::TextButton::textColourOffId, t.ink);
+    refreshMacroPlaceholders();
     themeSelect.repaint();
     repaint();
 }

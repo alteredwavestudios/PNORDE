@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(PnordeDreamSequencer VERSION 0.5.2 LANGUAGES C CXX)
+project(PnordeDreamSequencer VERSION 0.5.9 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,6 +59,17 @@ target_sources(PnordeDreamSequencer
         Source/PluginEditor.h
         Source/PnordeLights.h
         Source/PnordePresetFormat.h
+        Source/PnordeSafeCC.h
+        Source/PnordeLane.h
+        Source/PnordeVisualOrder.h
+        Source/PnordeAftertouchGlide.h
+        Source/PnordeTempoGlide.h
+        Source/PnordeDials.h
+        Source/PnordeScales.h
+        Source/PnordeEDO.h
+        Source/PnordeManualTempo.h
+        Source/PnordeMicroOutput.h
+        Source/PnordePatternLibrary.h
 )
 
 # JUCE compile settings.

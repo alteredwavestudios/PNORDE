@@ -60,15 +60,17 @@ struct PnordeLights final
         if (rect.isEmpty()) return;
         const float dark = juce::jlimit(0.0f, 0.75f, darkness);
         const float motion = juce::jlimit(0.0f, 1.0f, travellingGlow);
-        const float alpha = juce::jlimit(0.0f, 0.32f,
-            0.018f + dark * 0.055f + motion * (0.11f + dark * 0.12f));
+        // A clearly visible constant backlight, strengthened as each lane
+        // playhead passes. Avoid whole-window bloom and extra framebuffers.
+        const float alpha = juce::jlimit(0.0f, 0.66f,
+            0.16f + dark * 0.07f + motion * (0.31f + dark * 0.10f));
         g.setColour(colour.withAlpha(alpha));
         g.fillRoundedRectangle(rect.reduced(0.8f), 4.0f);
         if (motion > 0.025f || enabled)
         {
-            const float edge = juce::jlimit(0.0f, 0.65f,
-                0.045f + (enabled ? 0.12f : 0.0f) +
-                motion * (0.33f + dark * 0.24f));
+            const float edge = juce::jlimit(0.0f, 0.86f,
+                0.17f + (enabled ? 0.12f : 0.0f) +
+                motion * (0.41f + dark * 0.12f));
             g.setColour(colour.interpolatedWith(juce::Colours::white,
                 motion * 0.30f).withAlpha(edge));
             g.drawRoundedRectangle(rect.reduced(0.8f), 4.0f, 1.0f);
@@ -84,7 +86,7 @@ struct PnordeLights final
         const float motion = juce::jlimit(0.0f, 1.0f, travellingGlow);
         const float pulse = juce::jlimit(0.0f, 1.0f, beatPulse);
         const float alpha = juce::jlimit(0.0f, 0.96f,
-            0.08f + dark * 0.72f + motion * 0.19f + pulse * 0.12f);
+            0.24f + dark * 0.55f + motion * 0.22f + pulse * 0.12f);
         g.setColour(colour.interpolatedWith(juce::Colours::white,
             juce::jlimit(0.0f, 0.92f, pulse * 0.76f + motion * 0.14f))
             .withAlpha(alpha));

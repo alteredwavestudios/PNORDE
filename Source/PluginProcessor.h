@@ -4,6 +4,9 @@
 #include <atomic>
 #include <array>
 #include <memory>
+#include "PnordeLane.h"
+#include "PnordeScales.h"
+#include "PnordeMicroOutput.h"
 
 class PolyrhythmMIDIProcessor : public juce::AudioProcessor
 {
@@ -81,6 +84,15 @@ public:
     static constexpr int dedicatedCount = 5;
     static constexpr int baseLanes = 7;
     static constexpr int maxCustomCC = 8;
+    static constexpr int optionalCount = PnordeLane::rowCount;
+    using LaneType = PnordeLane::Type;
+    bool isOptionalLaneEnabled(int row) const noexcept;
+    int getOptionalLaneType(int row) const noexcept;
+    bool setOptionalLaneType(int row, int type) noexcept;
+    bool hasActiveLaneType(int type, int excludingRow = -1) const noexcept;
+    int activeCCMacroCount() const noexcept;
+    int addOptionalLane(int type) noexcept;
+    void removeOptionalLane(int row) noexcept;
     int getCustomCCCount() const noexcept { return customCCCount.load(); }
     void setCustomCCCount(int count) noexcept { customCCCount.store(juce::jlimit(0, 8, count)); }
     // 0 = custom CC, 1 = expression (CC11), 2 = mod wheel (CC1),
@@ -98,7 +110,32 @@ public:
     bool getTooltipsEnabled() const noexcept { return tooltipsEnabled.load(); }
     void setTooltipsEnabled(bool b) noexcept { tooltipsEnabled.store(b); }
     void requestMidiPanic() noexcept { panicRequested.store(true); }
+    bool getExperimentalLightsEnabled() const noexcept { return experimentalLights.load(std::memory_order_relaxed); }
+    void setExperimentalLightsEnabled(bool yes) noexcept { experimentalLights.store(yes, std::memory_order_relaxed); }
     double getHostBpm() const noexcept { return hostBpm.load(std::memory_order_relaxed); }
+    // 0: standard pitch bend; 1: experimental lower-zone MPE; 2: legacy
+    // saved alias for standard. All microtonal scales use an effective +/-2
+    // range and keep SLIDE as a tempo-relative pitch approach control.
+    int getMicroOutputMode() const noexcept
+    { return static_cast<int>(parameters.getRawParameterValue("pn_micro_mode")->load()); }
+    void setMicroOutputMode(int mode) noexcept;
+    bool getExperimentalPolyPressure() const noexcept
+    { return parameters.getRawParameterValue("pn_poly_pressure")->load() >= 0.5f; }
+    void setExperimentalPolyPressure(bool enabled) noexcept;
+    bool isMicrotonalScaleSelected() const noexcept
+    { return PnordeMicroOutput::isMicrotonalScale(getScale()); }
+    int getEffectiveBendRangeIndex() const noexcept
+    { return PnordeMicroOutput::effectiveBendRangeIndex(isMicrotonalScaleSelected(), getBendRangeIndex()); }
+    // Diagnostics show messages constructed by PNORDE, NOT host delivery.
+    int getLastPitchWheelValue() const noexcept { return lastPitchWheel.load(std::memory_order_relaxed); }
+    int getPitchWheelSendCount() const noexcept { return pitchWheelSends.load(std::memory_order_relaxed); }
+    int getLastEDOOffsetCents() const noexcept { return lastEDOOffsetCents.load(std::memory_order_relaxed); }
+    bool getManualTempoEnabled() const noexcept
+    { return parameters.getRawParameterValue("pn_manual_mode")->load() >= 0.5f; }
+    void setManualTempoEnabled(bool enabled) noexcept;
+    double getManualTempoBpm() const noexcept
+    { return parameters.getRawParameterValue("pn_manual_bpm")->load(); }
+    void setManualTempoBpm(double bpm) noexcept;
     int getMacroType(int slot) const noexcept;
     void setMacroType(int slot, int type) noexcept;
     int getMacroChannel(int slot) const noexcept; // 0 = follow notes (currently channel 1)
@@ -106,6 +143,19 @@ public:
     int getCustomCCNumber(int slot) const noexcept;
     void setCustomCCNumber(int slot, int number) noexcept;
     void removeCustomCC(int slot) noexcept;
+    // 0..100 = percentage of lane clock duration; -1 = older AUTO ramp.
+    // 101..201 retain explicit seconds from v0.5.5-6.1 presets.
+    int getAftertouchGlide(int step) const noexcept;
+    void setAftertouchGlide(int step, int value) noexcept;
+    // Visual row ordering never changes MIDI lane identity, data or automation.
+    int getDisplayRowAt(int optionalPosition) const noexcept;
+    void moveDisplayRow(int sourceRow, int targetRow) noexcept;
+    bool getExperimentalReorderEnabled() const noexcept { return experimentalReorder.load(std::memory_order_relaxed); }
+    void setExperimentalReorderEnabled(bool enabled) noexcept { experimentalReorder.store(enabled, std::memory_order_relaxed); }
+    // Per-step tempo-relative glide for Mod Wheel, Expression, Vibrato and Pan.
+    // Sustain, MIDI Channel and CC Macro keep their original separate behaviour.
+    int getOptionalGlide(int row, int step) const noexcept;
+    void setOptionalGlide(int row, int step, int value) noexcept;
     int getCCTransitionMs(int slot, int step) const noexcept;
     void setCCTransitionMs(int slot, int step, int ms) noexcept;
     juce::String getCustomCCLabel(int slot) const;
@@ -124,6 +174,9 @@ public:
     int getLaneCurrentStep(int row) const noexcept;
     int getLaneTiming(int row) const noexcept;
     void setLaneTiming(int row, int mode) noexcept;
+    // Global transpose is clamped at the final MIDI note (0..127).
+    int getGlobalOctave() const noexcept { return static_cast<int>(parameters.getRawParameterValue("pn_octave")->load()); }
+    void setGlobalOctave(int octave) noexcept;
     int getGlobalClockIndex() const noexcept { return static_cast<int>(parameters.getRawParameterValue("pn_clock")->load()); }
     void setGlobalClockIndex(int index) noexcept;
     int getBendRangeIndex() const noexcept { return static_cast<int>(parameters.getRawParameterValue("pn_bend")->load()); }
@@ -132,7 +185,14 @@ public:
     int getThemeIndex() const noexcept { return static_cast<int>(parameters.getRawParameterValue("pn_theme")->load()); }
     void setThemeIndex(int index) noexcept;
     int getKey() const noexcept { return static_cast<int>(parameters.getRawParameterValue("pn_key")->load()); }
-    int getScale() const noexcept { return static_cast<int>(parameters.getRawParameterValue("pn_scale")->load()); }
+    int getScale() const noexcept
+    {
+        const int edo = static_cast<int>(parameters.getRawParameterValue("pn_scale_edo")->load());
+        if (edo > 0) return PnordeEDO::firstScaleIndex - 1 + edo;
+        const int extended = static_cast<int>(parameters.getRawParameterValue("pn_scale_ex")->load());
+        return extended > 0 ? PnordeScales::legacyCount - 1 + extended
+                            : static_cast<int>(parameters.getRawParameterValue("pn_scale")->load());
+    }
     void setKey(int value) noexcept;
     void setScale(int value) noexcept;
     int quantizePitchTenths(int tenths, int octave) const noexcept;
@@ -201,17 +261,26 @@ private:
     std::atomic<int> darknessPercent { 0 };
     std::atomic<bool> animationsEnabled { true }, scrollFadesEnabled { true }, tooltipsEnabled { true };
     std::atomic<bool> panicRequested { false };
+    std::atomic<bool> experimentalLights { false };
+    std::atomic<bool> experimentalReorder { false };
+    std::atomic<int> lastPitchWheel { 8192 }, pitchWheelSends { 0 }, lastEDOOffsetCents { 0 };
+    std::array<std::atomic<int>, optionalCount> displayOrder {};
+    std::array<std::atomic<int>, maxSteps> aftertouchGlide {};
+    std::array<std::array<std::atomic<int>, maxSteps>, optionalCount> optionalGlides {};
     std::atomic<int> customCCCount { 0 };
+    std::array<std::atomic<int>, optionalCount> laneTypes {};
     std::array<std::atomic<int>, maxCustomCC> macroTypes {};
     std::array<std::atomic<int>, maxCustomCC> macroChannels {};
-    std::array<std::atomic<int>, maxCustomCC> customCCNumbers {};
+    std::array<std::atomic<int>, optionalCount> customCCNumbers {};
     mutable juce::SpinLock customCCLabelsLock;
-    std::array<juce::String, maxCustomCC> customCCLabels;
-    std::array<std::array<std::atomic<int>, maxSteps>, maxCustomCC> ccTransitionMs {};
+    std::array<juce::String, optionalCount> customCCLabels;
+    std::array<std::array<std::atomic<int>, maxSteps>, optionalCount> ccTransitionMs {};
     std::array<std::array<std::atomic<int>, maxSteps>, laneCount> laneValues;
     std::array<std::atomic<int>, laneCount> laneCurrentSteps;
 
     // Audio-thread-only state; never touched by the editor.
+    bool mpeZoneConfigured = false;
+    int previousMicroMode = -1;
     bool noteIsActive = false;
     int activeNote = 60;
     int activeChannel = 1;
@@ -220,6 +289,10 @@ private:
     double noteOffPpq = 0.0;
     double previousBlockEndPpq = 0.0;
     bool previousBlockWasPlaying = false;
+    // Audio-thread-owned beat accumulator for opt-in tempo override.
+    bool previousManualMode = false;
+    double manualBlockEndPpq = 0.0;
+    double previousHostBlockEndPpq = 0.0;
     double glideStartPpq = 0.0, glideEndPpq = 0.0;
     double glideFromSemis = 60.0, glideToSemis = 60.0;
     double lastPitchSemis = 60.0;
@@ -229,12 +302,15 @@ private:
     double nextModulationPpq = 0.0;
     int lastPressureSent = -1;
     int lastAftertouchStep = -1;
-    std::array<int, maxCustomCC> lastCCSent {};
-    std::array<int, maxCustomCC> lastCCStep {};
-    std::array<double, maxCustomCC> ccFrom {}, ccTo {}, ccStartPpq {}, ccEndPpq {};
-    std::array<int, maxCustomCC> lastCCNumber {};
-    std::array<int, 6> dedicatedSent {{ -1, -1, -1, -1, -1, -1 }};
-    std::array<int, 6> dedicatedSentChannel {{ -1, -1, -1, -1, -1, -1 }};
+    std::array<int, optionalCount> lastCCSent {};
+    std::array<int, optionalCount> lastCCStep {};
+    std::array<double, optionalCount> ccFrom {}, ccTo {}, ccStartPpq {}, ccEndPpq {};
+    std::array<int, optionalCount> lastCCNumber {};
+    std::array<int, optionalCount> lastOptionalType {};
+    std::array<int, optionalCount * 2> dedicatedSent {};
+    std::array<int, optionalCount * 2> dedicatedSentChannel {};
+    std::array<int, optionalCount * 2> dedicatedTargetStep {}, dedicatedController {};
+    std::array<double, optionalCount * 2> dedicatedFrom {}, dedicatedTo {}, dedicatedStartPpq {}, dedicatedEndPpq {};
     bool hadPreviousPitch = false;
     bool legatoVoice = false;
 

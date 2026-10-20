@@ -1,20 +1,27 @@
+# CMake and Visual Studio generated files
 build/
 build*/
-.vs/
-.idea/
-.vscode/
-CMakeCache.txt
 CMakeFiles/
+CMakeCache.txt
 *.sln
 *.vcxproj*
+.vs/
+.idea/
 *.user
-*.obj
+*.suo
+# Generated audio plugin bundles / local binaries
+*.vst3/
+*.aaxplugin/
+*.component/
+*.dll
+*.exe
 *.pdb
-*.ilk
-*.exp
-*.lib
-*.log
-*.tmp
+# Presets generated during testing
 *.pnorde
-Backups/
-.DS_Store
+# Editor temporary files
+*.tmp
+*.bak
+
+# Separate clean and sanitizer configurations
+build-clean-*/
+build-asan*/
