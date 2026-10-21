@@ -10,7 +10,7 @@
 // corruption detector, not a signature or a trust guarantee.
 namespace PnordePresetFormat
 {
-    constexpr size_t maxPayloadBytes = 1024u * 1024u;
+    constexpr size_t maxPayloadBytes = 4u * 1024u * 1024u;
     constexpr size_t headerBytes = 16u;
     constexpr size_t maxDiskBytes = maxPayloadBytes + headerBytes;
     constexpr std::array<juce::uint8, 8> magic {{

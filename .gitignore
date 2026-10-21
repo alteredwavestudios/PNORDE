@@ -1,27 +1,73 @@
-# CMake and Visual Studio generated files
+﻿# Build outputs
 build/
-build*/
+build-*/
+build-clean-*/
+cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
+*.vcxproj
 *.sln
-*.vcxproj*
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.tlog
+*.exe
+
+# Compiled plugins
+*.vst3
+*.vst3-disabled
+*.dll
+*.component
+*.aaxplugin
+
+# Development and local files
 .vs/
+.vscode/
 .idea/
 *.user
 *.suo
-# Generated audio plugin bundles / local binaries
-*.vst3/
-*.aaxplugin/
-*.component/
+.DS_Store
+Thumbs.db
+
+# Backups and temporary files
+VST3-backups/
+*.backup
+*.bak
+*.tmp
+*.log
+__pycache__/
+
+# PNORDE build directories
+build/
+build-*/
+build-clean-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# Visual Studio
+.vs/
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.tlog
+*.suo
+*.user
+
+# Compiled plugins
+*.vst3
+*.vst3-disabled
 *.dll
 *.exe
-*.pdb
-# Presets generated during testing
-*.pnorde
-# Editor temporary files
-*.tmp
-*.bak
+*.aaxplugin
+*.component
 
-# Separate clean and sanitizer configurations
-build-clean-*/
-build-asan*/
+# Temporary and backup files
+VST3-backups/
+__pycache__/
+*.bak
+*.backup
+*.tmp
+*.log

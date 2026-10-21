@@ -2,6 +2,8 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 #include "PnordeDials.h"
+#include "PnordeCompositionEngine.h"
+#include "PnordeVibes.h"
 #include <array>
 #include <cmath>
 #include <functional>
@@ -27,6 +29,19 @@ public:
     {
         if (onReset) onReset();
         else juce::ComboBox::mouseDoubleClick(event);
+    }
+};
+
+// Quick-program buttons keep their ordinary left-click behaviour; right-click
+// owns a bank management menu without changing the selected program.
+class PnordeQuickProgramButton : public juce::TextButton
+{
+public:
+    std::function<void()> onContext;
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        if (event.mods.isPopupMenu()) { if (onContext) onContext(); return; }
+        juce::TextButton::mouseDown(event);
     }
 };
 
@@ -63,6 +78,70 @@ public:
     }
 };
 
+// Keeps editable Macro names and playback-direction menus independent.
+class PnordeMacroNameEditor final : public juce::TextEditor
+{
+public:
+    PnordeMacroNameEditor()
+    {
+        setOpaque(false);
+        setBorder(juce::BorderSize<int>(0));
+        setIndents(0, 0);
+    }
+    std::function<void()> onDirectionMenu;
+    std::function<void()> onDirectionDial;
+    void setEditingTextColour(juce::Colour colour)
+    {
+        editingTextColour = colour;
+        updateTextVisibility();
+    }
+    void focusGained(FocusChangeType cause) override
+    {
+        juce::TextEditor::focusGained(cause);
+        updateTextVisibility();
+    }
+    void focusLost(FocusChangeType cause) override
+    {
+        juce::TextEditor::focusLost(cause);
+        updateTextVisibility();
+    }
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        if ((event.mods.isCtrlDown() || event.mods.isCommandDown()) && event.mods.isLeftButtonDown())
+        { if (onDirectionDial) onDirectionDial(); return; }
+        if (event.mods.isPopupMenu())
+        { if (onDirectionMenu) onDirectionMenu(); return; }
+        juce::TextEditor::mouseDown(event);
+    }
+    void paint(juce::Graphics& g) override
+    {
+        // The editor's final luminous pass owns the ordinary label pixels.
+        // Showing this TextEditor at the same time caused doubled names in
+        // v0.6.12/13. Display the native editor ONLY while actually editing.
+        // Keep this component visible for hit-testing and Ctrl/Cmd-click.
+        if (!hasKeyboardFocus(true)) return;
+        const auto bg = findColour(juce::TextEditor::backgroundColourId);
+        if (!bg.isTransparent())
+        {
+            g.setColour(bg);
+            g.fillRoundedRectangle(getLocalBounds().toFloat(), 4.0f);
+        }
+        juce::TextEditor::paint(g);
+    }
+private:
+    void updateTextVisibility()
+    {
+        // A native TextEditor may paint its glyphs using internal child
+        // components, so skipping paint() alone is insufficient.
+        setColour(juce::TextEditor::textColourId,
+                  hasKeyboardFocus(true) ? editingTextColour : juce::Colours::transparentBlack);
+        repaint();
+    }
+    juce::Colour editingTextColour { juce::Colours::white };
+};
+
+class PnordeOverlayHost;
+
 class PolyrhythmMIDIEditor : public juce::AudioProcessorEditor, public juce::TooltipClient, private juce::Timer
 {
 public:
@@ -80,7 +159,17 @@ public:
     void mouseWheelMove(const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
     juce::String getTooltip() override;
 private:
-    static constexpr int lanes = 21, visibleSteps = 16;
+    static constexpr int lanes = 21;
+    int visibleSteps = 16; // 16 / 8 / 4: display pages only, never modifies MIDI lanes
+    int columnsForWidth(int width) const noexcept;
+    float stepStride() const noexcept;
+    float workWidth() const noexcept;
+    float workLeft() const noexcept;
+    float gridStartX() const noexcept;
+    float clockStartX() const noexcept;
+    float timingStartX() const noexcept;
+    float pageStartX() const noexcept;
+    juce::Rectangle<int> headerBounds(int control) const noexcept;
     static constexpr int channelRow = PolyrhythmMIDIProcessor::channelLane;
     static constexpr int modRow = PolyrhythmMIDIProcessor::modRow;
     static constexpr int expressionRow = PolyrhythmMIDIProcessor::expressionRow;
@@ -92,6 +181,7 @@ private:
         int length = 16, division = 2, page = 0, hovered = -1;
         bool markerDrag = false, lengthDrag = false, numberDrag = false;
         float rangeOpacity[128] {};
+        float interactionFlash[128] {};
         float stepLed = 0.0f;
         float stepPhase = 0.0f;
         double stepDurationMs = 500.0;
@@ -107,6 +197,8 @@ private:
         std::array<int, 128> values {};
     };
     std::array<Lane, lanes> lane;
+    PnordeVibesRenderer vibes;
+
     PolyrhythmMIDIProcessor& processor;
     std::array<PnordeResetComboBox, lanes> divisions;
     std::array<juce::ComboBox, lanes> timings;
@@ -133,7 +225,33 @@ private:
     PnordeCogButton settingsButton;
     juce::TextButton savePresetButton { "SAVE PRESET" };
     juce::TextButton loadPresetButton { "LOAD PRESET" };
-    juce::TextButton randomiseButton { "RANDOMISE" };
+    juce::TextButton playButton { "PAUSE" }, resetButton { "RESET" };
+    void showLoadPresetMenu();
+    void applyFactoryPreset(int index);
+    void showLaneDirectionMenu(int row);
+    void showLaneDirectionPanel(int row);
+    juce::TextButton randomiseButton { "GENERATE" };
+    juce::TextButton globalReverseButton { "REV: OFF" };
+    std::array<PnordeQuickProgramButton, 4> quickPrograms {};
+    void showProgramMenu(int index);
+    void showProgramLaneMenu();
+    PnordeClockDial programClockDial;
+    PnordeTimingDial programTimingDial;
+    int programHoverStep = -1;
+    int lastProgramPlayheadStep = -2;
+    int programLanePage = 0;
+    float programLaneTop() const noexcept;
+    juce::Rectangle<float> programLaneCell(int localStep) const noexcept;
+    void paintProgramLane(juce::Graphics&);
+    void paintProgramLaneForeground(juce::Graphics&);
+
+    int lastDisplayedProgram = -1;
+    void refreshProgramButtons();
+    void showClocksMenu(int row);
+    void openContainedPanel(std::unique_ptr<juce::Component> panel,
+                            juce::Rectangle<int> anchor);
+    void dismissContainedPanel();
+    std::unique_ptr<PnordeOverlayHost> popupOverlay;
     juce::TextButton presetFolderButton { "PRESET DIR" };
     std::unique_ptr<juce::PropertiesFile> presetPreferences;
     juce::File presetDirectory;
@@ -145,17 +263,36 @@ private:
     void savePreset();
     void loadPreset();
     void randomisePattern();
+    void applyMusicalPhrase(const PnordeCompositionEngine::Phrase& phrase);
+    void applyComposition(int index, std::uint32_t seed);
     void syncFromProcessor();
     juce::Slider darknessSlider;
     bool lastTransportPlaying = false;
     int animationTimerHz = 24;
+    double nextVibesFrameMs = 0.0; // Message thread; HPPD 1-60 FPS deadline
+    int lastVibesIntensity = -1;
+    int lastVibesMode = -1;
+    bool lastVibesEnabled = false;
     void showSettingsMenu();
     void applyTooltips();
     bool rowVisible(int row) const noexcept;
     int visibleIndex(int row) const noexcept;
     int visibleRowCount() const noexcept;
     std::array<juce::ComboBox, optionalLanes> ccSelect;
-    std::array<juce::TextEditor, optionalLanes> ccLabelEditors;
+    std::array<PnordeMacroNameEditor, optionalLanes> ccLabelEditors;
+    std::array<PnordeMacroNameEditor, lanes> laneNameEditors;
+    std::array<juce::String, lanes> savedLaneNames;
+    bool bottomLeftResizeActive = false;
+    juce::Point<int> bottomLeftResizeOrigin;
+    juce::Rectangle<float> footerCreditBounds() const noexcept;
+    juce::Rectangle<int> bottomLeftResizeBounds() const noexcept
+    {
+        const int h = getHeight();
+        return { 8, juce::roundToInt(h * 0.925f) + 6, 22, juce::jmax(16, juce::roundToInt(h * 0.040f)) };
+    }
+    juce::String midiDescription(int row) const;
+    juce::String laneHoverDescription(int row) const;
+    void syncLaneNames();
     std::array<juce::String, optionalLanes> committedCCLabels;
     float ccPopupAlpha = 0.0f;
     int ccPopupRow = -1, ccPopupStep = -1;
@@ -172,12 +309,15 @@ private:
     void refreshMacroPlaceholders();
     // Weak pointer: modal CallOutBox is owned by JUCE and can dismiss itself.
     juce::Component::SafePointer<juce::CallOutBox> settingsCallout;
+    juce::Component::SafePointer<juce::CallOutBox> directionCallout;
+    juce::Component::SafePointer<juce::CallOutBox> infoCallout;
     // Child controls live inside a clipped viewport; the fixed header never scrolls.
     juce::Component scrollViewport, scrollContent;
     float scrollY = 0.0f, targetScrollY = 0.0f;
     float maxScroll() const;
     void syncCCVisibility();
     double pulse = 0.0, backgroundPhase = 0.0, huePhase = 0.0;
+    bool logoHover = false, creditHover = false;
     float scrollbarOpacity = 0.0f;
     juce::TooltipWindow tooltipWindow { this, 700 };
     

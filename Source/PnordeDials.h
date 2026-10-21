@@ -10,10 +10,10 @@ class PnordeChoiceDial final : public juce::Component, public juce::TooltipClien
 {
 public:
     std::function<void(int)> onChange;
-    void setChoices(const juce::StringArray& choices, int initial)
+    void setChoices(const juce::StringArray& choices, int startingIndex)
     {
         names = choices;
-        setIndex(initial);
+        setIndex(startingIndex);
     }
     void setIndex(int value)
     {
@@ -29,21 +29,23 @@ public:
     juce::String getTooltip() override
     { if (!tooltipsEnabled || names.isEmpty()) return {};
       return description + ": " + names[juce::jlimit(0, juce::jmax(0, names.size()-1), index)] +
-          ". Click to choose (Key/Scale), drag or scroll to change."; }
+          (description == "SCALE" && index == 13
+             ? ". FREE 0.1 bypasses Key and scale quantisation; Shift-click or select Reset to Major."
+             : ". Click to choose, drag/scroll to change; double-click Scale for Major."); }
     void paint(juce::Graphics& g) override
     {
         const auto r = getLocalBounds().toFloat();
         const float diameter = juce::jmin(r.getHeight()-4.0f, r.getWidth()*0.48f);
         const float radius = juce::jmax(3.0f, diameter * 0.5f);
         const float cx = r.getX()+radius+3.0f, cy = r.getCentreY();
-        g.setColour(bg); g.fillEllipse(cx-radius, cy-radius, diameter, diameter);
+        g.setColour(bg.getPerceivedBrightness() > 0.5f ? bg.darker(0.40f) : bg.darker(0.18f)); g.fillEllipse(cx-radius, cy-radius, diameter, diameter);
         g.setColour(fg.withAlpha(0.35f)); g.drawEllipse(cx-radius, cy-radius, diameter, diameter, 1.1f);
         constexpr float from = juce::MathConstants<float>::pi * 0.75f;
         constexpr float extent = juce::MathConstants<float>::pi * 1.5f;
         juce::Path ring;
         const float proportion = (float) index / (float) juce::jmax(1, names.size()-1);
         ring.addCentredArc(cx, cy, radius-3.0f, radius-3.0f, 0.0f, from, from + extent*juce::jmax(0.005f,proportion), true);
-        g.setColour(glow); g.strokePath(ring, juce::PathStrokeType(2.8f));
+        g.setColour(glow.brighter(0.35f)); g.strokePath(ring, juce::PathStrokeType(3.1f));
         const float a = from + extent * proportion;
         const float dotR = radius - 3.0f;
         g.setColour(glow.brighter(0.20f));
@@ -63,21 +65,37 @@ public:
         if (dragged)
             update(initial + juce::roundToInt((anchor.y-e.position.y + e.position.x-anchor.x) / 10.0f));
     }
+    void mouseDoubleClick(const juce::MouseEvent&) override
+    {
+        if (description == "SCALE") update(1); // Major quick reset
+        else if (description == "KEY") update(0); // C quick reset
+    }
     void mouseUp(const juce::MouseEvent& e) override
     {
-        // Opening a popup on click avoids imprecise dial gestures changing
-        // an unrelated value (especially for Key/Scale). Dragging still works.
-        juce::ignoreUnused(e);
+        // Clicking opens a discrete menu; Shift-click Scale reliably resets
+        // Major even when the host's popup dismisses double-click events.
         if (dragged || (description != "SCALE" && description != "KEY")) return;
+        if (e.mods.isShiftDown() && description == "SCALE") { update(1); return; }
         juce::PopupMenu menu;
+        if (description == "SCALE")
+        {
+            menu.addItem(1001, "RESET TO MAJOR", true, index == 1);
+            menu.addSeparator();
+        }
         for (int i=0; i<names.size(); ++i)
             menu.addItem(i+1,names[i],true,i==index);
         juce::Component::SafePointer<PnordeChoiceDial> safe(this);
         menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(this),
-            [safe](int id) { if (safe != nullptr && id>0) safe->update(id-1); });
+            [safe](int id) { if (safe != nullptr && id>0)
+                safe->update(id == 1001 ? 1 : id-1); });
     }
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
-    { juce::ignoreUnused(e); update(index + (wheel.deltaY > 0 ? 1 : wheel.deltaY < 0 ? -1 : 0)); }
+    {
+        // Ctrl/Cmd+wheel belongs to the editor's brightness shortcut.
+        if (e.mods.isCtrlDown() || e.mods.isCommandDown())
+        { juce::Component::mouseWheelMove(e, wheel); return; }
+        update(index + (wheel.deltaY > 0 ? 1 : wheel.deltaY < 0 ? -1 : 0));
+    }
 private:
     void update(int value)
     {
@@ -101,6 +119,7 @@ class PnordeLaneDial : public juce::Component, public juce::TooltipClient
 {
 public:
     std::function<void(int)> onChange;
+    std::function<void()> onContextMenu;
     void setup(int maximum, int initial, const char* const* labels, const char* purpose)
     {
         maxValue=maximum; names=labels; description=purpose; setValue(initial);
@@ -121,11 +140,19 @@ public:
     void paint(juce::Graphics& g) override { drawFace(g,0.0f,0.0f,false); }
     void drawIllumination(juce::Graphics& g,float x,float y) const
     { drawFace(g,x,y,true); }
-    void mouseDown(const juce::MouseEvent& e) override { original=index; origin=e.position; }
+    void mouseDown(const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) { if (onContextMenu) onContextMenu(); return; }
+        original=index; origin=e.position;
+    }
     void mouseDrag(const juce::MouseEvent& e) override
-    { update(original+juce::roundToInt((origin.y-e.position.y)/9.0f)); }
+    { if (e.mods.isLeftButtonDown()) update(original+juce::roundToInt((origin.y-e.position.y)/9.0f)); }
     void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override
-    { juce::ignoreUnused(e); update(index+(wheel.deltaY>0?1:wheel.deltaY<0?-1:0)); }
+    {
+        if (e.mods.isCtrlDown() || e.mods.isCommandDown())
+        { juce::Component::mouseWheelMove(e, wheel); return; }
+        update(index + (wheel.deltaY > 0 ? 1 : wheel.deltaY < 0 ? -1 : 0));
+    }
     void mouseDoubleClick(const juce::MouseEvent&) override { update(defaultValue); }
 protected:
     void setDefault(int v) noexcept { defaultValue=v; }
@@ -140,9 +167,9 @@ private:
         // The face is circular in BOTH passes, never an undimmed rectangle.
         if (highlightsOnly)
             g.setColour(bg.getPerceivedBrightness() > 0.50f
-                ? bg.darker(0.67f) : bg.brighter(0.26f));
+                ? bg.darker(0.76f) : bg.brighter(0.18f));
         else
-            g.setColour(bg.brighter(0.12f));
+            g.setColour(bg.getPerceivedBrightness() > 0.50f ? bg.darker(0.48f) : bg.darker(0.15f));
         g.fillEllipse(cx-r,cy-r,2.0f*r,2.0f*r);
         if (!highlightsOnly)
         {
@@ -152,11 +179,13 @@ private:
         const float start=juce::MathConstants<float>::pi*0.75f;
         const float extent=juce::MathConstants<float>::pi*1.5f;
         const float factor=(float)index/(float)juce::jmax(1,maxValue);
+        const bool hovered = isMouseOverOrDragging();
         juce::Path arc;
         arc.addCentredArc(cx,cy,r-2.2f,r-2.2f,0.0f,start,start+extent*juce::jmax(0.007f,factor),true);
-        g.setColour(accent.brighter(highlightsOnly?0.58f:0.20f));
-        g.strokePath(arc,juce::PathStrokeType(highlightsOnly?2.7f:2.4f));
-        g.setColour(accent.brighter(0.63f));
+        const float hoverBoost = hovered ? (highlightsOnly ? 1.20f : 0.70f) : 0.0f;
+        g.setColour(accent.brighter((highlightsOnly?0.90f:0.35f) + hoverBoost));
+        g.strokePath(arc,juce::PathStrokeType(highlightsOnly ? (hovered ? 3.6f : 3.0f) : (hovered ? 3.0f : 2.6f)));
+        g.setColour(accent.brighter(hovered ? 0.95f : 0.63f));
         const float theta=start+extent*factor;
         g.fillEllipse(cx+std::sin(theta)*(r-2.2f)-1.7f,
                       cy-std::cos(theta)*(r-2.2f)-1.7f,3.4f,3.4f);

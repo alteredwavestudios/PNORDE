@@ -31,3 +31,12 @@
 - Effective bend-range selection uses constant comparisons and an unchanged atomic parameter. Old non-microtonal bend preferences are retained.
 - Separate output mode / Poly AT settings are written on UI thread only; MIDI events use the existing bounded host MidiBuffer. Diagnostic values measure constructed MIDI, not guaranteed delivery.
 - Standalone sanitizer tests exercise bend mode policy, EDO quantization and tempo-relative interpolation; full Windows JUCE/Live runtime profiling is still necessary.
+
+
+## v0.6.0 safety and paint notes
+
+- Pure, deterministic fixed-`std::array` pan/slide/gate/velocity/factory helpers run on the UI thread; they are tested at 128-step bounds under AddressSanitizer/UndefinedBehaviorSanitizer. These tests do not exercise the JUCE plugin object or Ableton.
+- Direction indexing is bounded in 1–128 steps; the scheduler reads a host-visible atomic direction per lane, and no per-step dynamic allocations were introduced in the audio callback.
+- Added a one-time host-stop MIDI reset guard, preventing repeated channel-pressure reset messages for each stopped audio callback.
+- Psychedelic effects are opt-in and rendered only inside the work-area step grid; the effect uses eight bounded radial washes and should not cause full-screen flashes. The intensity is capped to 40%; this is NOT a guarantee of photosensitive safety.
+- Full VST3 validation and Windows profiling remain outstanding; don't claim no leaks or no security issues merely from header tests.

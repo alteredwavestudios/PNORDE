@@ -1,4 +1,10 @@
-# PNORDE v0.5.9 — Pre-Windows-1.0 test checklist
+v0.6.2: See V062_STABILITY_AUDIT_AND_BUILD.md for new audio-thread scheduling guards, external MIDI worker changes, repaint invalidation improvements and benchmarking instructions. Existing compatibility tests retained.
+
+## v0.6.1 verification
+
+See `V061_BUILD_AND_TEST.md` for retained-lane-clock, automation and Vibes-specific tests.
+
+# PNORDE v0.6.0 — Pre-Windows-1.0 test checklist
 
 Do **not** publish as 1.0 until the clean Windows VST3 build and these tests pass.
 
@@ -68,3 +74,16 @@ Do **not** publish as 1.0 until the clean Windows VST3 build and these tests pas
 - [ ] With **standard pitch bend** or **experimental MPE**, note-on pitch bend and all interpolated bends use an effective +/-2 range. MPE zone RPN requests +/-2; check recipient synth's member channel configuration. Poly Aftertouch is independently opt-in (defaults OFF) and can be enabled whether MPE is selected or not.
 - [ ] Test consecutive large (>2 semitone) leaps: new-note pitch glide cannot cover the full jump under +/-2 and must clamp rather than send illegal bend values or stuck notes.
 - [ ] Confirm Ableton forwards Pitch Wheel events via MIDI Monitor; exact microtones cannot be guaranteed by code tests alone.
+
+## v0.6.0 test matrix (required before tagging 1.0)
+
+- [ ] Install only after a clean successful `build-clean-v061` Release VST3 build. Confirm plugin version and MIDI routing in a **new Ableton set**.
+- [ ] Save a copy of each v0.5.9 project and verify loading leaves its earlier C4 pitch reference, CC routing, tempo, automation and EDO scales unchanged. In a new project, confirm C3 MIDI note 48 at global octave 0 and range -3..+3 clips safely at MIDI 0..127.
+- [ ] Right-click ALL lane labels (including SEQ and editable Macro labels) and set Forward, Backward, Ping Pong; verify audible MIDI sequences, 1-step and 2-step ping-pong, page numbers and saved preset reload.
+- [ ] In Ableton automation/MIDI mapping, check Global Clock, Key, Scale, Octave, per-lane Division/Timing/Direction, Manual BPM/On, PNORDE Play and Reset. Verify they are distinct parameters with no cross-mapping; only musical controls are claimed as mappable.
+- [ ] PAUSE silences PNORDE without stopping Ableton. RESET restarts local sequence phase while Ableton continues; no stuck notes, repeated pressure floods or sudden tempo jumps. Stress stop/play/seek/reset with fast and slow clocks.
+- [ ] In Load Preset, test every built-in Ambient, Dance, Experimental and Generative recipe. Existing MIDI route remains valid; save/load copy works. Confirm Pan is unique and no more than 8 Macro lanes are created.
+- [ ] Under RANDOMISE test all 12 Gate, 10 Velocity, 12 Pan and 10 SLIDE recipes. Test Pan positions 0..127 and tempo-relative glide 0..100; no changes to unrelated existing lanes when using a single-lane recipe.
+- [ ] Compare idle CPU with v0.5.9 (Editor closed/open). With psychedelic OFF, verify no extra periodic gradients; with ON, compare 0, 10, 20 and 40% at three GUI sizes and after repeated open/close. Ensure no screen-wide strobe or unexpected redraw of header/footer.
+- [ ] Run Windows AddressSanitizer standalone (`BUILD_ASAN_STANDALONE_WINDOWS.ps1`) and a Release run with multiple PNORDE instances, preset import/export, JUCE component destruction/recreation, memory snapshots and transport edge cases. These are NOT covered by the standalone header tests.
+- [ ] Check font licence, JUCE licence and third-party attribution before publishing the matching *source* as an open-source release. The binary prerelease is a separate artifact.

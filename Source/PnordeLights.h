@@ -50,6 +50,29 @@ struct PnordeLights final
         g.fillRoundedRectangle(shape, corner);
     }
 
+    // Single radial gradient gives a wide, smooth falloff for the current
+    // musical step or recent edit. Only draw for active pulses, not every cell.
+    static void cellHalo(juce::Graphics& g, juce::Rectangle<float> rect,
+                         juce::Colour colour, float pulseStrength,
+                         float darkness, float strength)
+    {
+        if (rect.isEmpty()) return;
+        const float p = juce::jlimit(0.0f, 1.0f, pulseStrength);
+        const float gain = juce::jlimit(0.0f, 1.0f, strength);
+        if (p < 0.025f || gain < 0.01f) return;
+        const auto lit = colour.withMultipliedSaturation(1.30f)
+                               .interpolatedWith(juce::Colours::white, p * 0.30f);
+        const float radius = juce::jmax(10.0f, rect.getWidth() * (0.95f + 0.46f * gain));
+        const auto centre = rect.getCentre();
+        juce::ColourGradient halo(lit.withAlpha(juce::jlimit(0.0f, 0.80f,
+                                p * gain * (0.48f + darkness * 0.32f))),
+                                   centre.x, centre.y,
+                                   lit.withAlpha(0.0f), centre.x + radius, centre.y, true);
+        halo.addColour(0.33, lit.withAlpha(juce::jlimit(0.0f, 0.45f, p * gain * 0.20f)));
+        g.setGradientFill(halo);
+        g.fillEllipse(centre.x-radius, centre.y-radius, radius*2.0f, radius*2.0f);
+    }
+
     // Low-cost emissive cell pass. Invoked AFTER the global dimmer, so both
     // filled parameter bars and unfilled circuit traces remain luminous.
     // Only the active beat uses the expensive halo renderer above.
@@ -85,11 +108,15 @@ struct PnordeLights final
         const float dark = juce::jlimit(0.0f, 0.75f, darkness);
         const float motion = juce::jlimit(0.0f, 1.0f, travellingGlow);
         const float pulse = juce::jlimit(0.0f, 1.0f, beatPulse);
-        const float alpha = juce::jlimit(0.0f, 0.96f,
-            0.24f + dark * 0.55f + motion * 0.22f + pulse * 0.12f);
-        g.setColour(colour.interpolatedWith(juce::Colours::white,
-            juce::jlimit(0.0f, 0.92f, pulse * 0.76f + motion * 0.14f))
-            .withAlpha(alpha));
+        const float alpha = juce::jlimit(0.0f, 1.0f,
+            0.28f + dark * 0.72f + motion * 0.22f + pulse * 0.12f);
+        // Dark mode: lift the luminosity of ACTIVE cells, but preserve vivid
+        // theme hue instead of washing the bar out towards white.
+        auto lit = colour.withMultipliedSaturation(1.0f + dark * 0.35f)
+                         .brighter(dark * (0.28f + motion * 0.14f));
+        lit = lit.interpolatedWith(juce::Colours::white,
+            juce::jlimit(0.0f, 0.70f, pulse * 0.42f + motion * 0.06f));
+        g.setColour(lit.withAlpha(alpha));
         g.fillRoundedRectangle(bar, juce::jmin(3.0f, bar.getHeight() * 0.5f));
     }
 

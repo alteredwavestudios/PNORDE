@@ -1,9 +1,14 @@
 #include "PluginProcessor.h"
+#include "PnordeProjectVersion.h"
+#include <string>
 #include "PnordeSafeCC.h"
 #include "PnordeVisualOrder.h"
 #include "PnordeAftertouchGlide.h"
 #include "PnordeTempoGlide.h"
 #include "PnordeManualTempo.h"
+#include "PnordeRetainedTransport.h"
+#include "PnordeProgramLane.h"
+#include "PnordeProgramRequests.h"
 #include "PluginEditor.h"
 
 #include <cmath>
@@ -28,27 +33,41 @@ public:
     std::array<Event, capacity> events {};
     std::atomic<unsigned> read { 0 }, write { 0 };
     std::shared_ptr<juce::MidiOutput> port;
+    // Publish only an atomic flag to processBlock; atomic_load(shared_ptr)
+    // may use an internal lock and must stay on the worker/UI threads.
+    std::atomic<bool> outputReady { false };
+    std::atomic<unsigned> droppedEvents { 0 };
 
     void setPort(std::shared_ptr<juce::MidiOutput> next)
     {
+        const bool ready = (next != nullptr);
         std::atomic_store(&port, std::move(next));
+        outputReady.store(ready, std::memory_order_release);
         // Flush pending messages so events from the old port don't leak to the new one.
         // The worker owns the read index; it notices the generation change.
         generation.fetch_add(1, std::memory_order_release);
         notify();
     }
-    bool active() const { return std::atomic_load(&port) != nullptr; }
+    bool active() const noexcept { return outputReady.load(std::memory_order_acquire); }
     void enqueue(const juce::MidiMessage& msg, double dueMs)
     {
         if (msg.getRawDataSize() < 1 || msg.getRawDataSize() > 3) return;
         const auto w = write.load(std::memory_order_relaxed);
         const auto next = (w + 1) % capacity;
-        if (next == read.load(std::memory_order_acquire)) return;
+        const auto r = read.load(std::memory_order_acquire);
+        if (next == r)
+        {
+            droppedEvents.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const bool wasEmpty = (w == r);
         auto& e = events[w];
         e.dueMs = dueMs; e.size = msg.getRawDataSize();
         for (int i = 0; i < e.size; ++i) e.data[i] = msg.getRawData()[i];
         write.store(next, std::memory_order_release);
-        notify();
+        // Notify only when transitioning from empty to nonempty. While the
+        // queue contains events the worker polls their due timestamps itself.
+        if (wasEmpty) notify();
     }
     void run() override
     {
@@ -62,7 +81,7 @@ public:
                 currentGeneration = gen;
             }
             const auto r = read.load(std::memory_order_relaxed);
-            if (r == write.load(std::memory_order_acquire)) { wait(2); continue; }
+            if (r == write.load(std::memory_order_acquire)) { wait(50); continue; }
             const auto e = events[r];
             const double remaining = e.dueMs - juce::Time::getMillisecondCounterHiRes();
             if (remaining > 1.5) { wait(juce::jlimit(1, 5, int(remaining))); continue; }
@@ -100,6 +119,11 @@ juce::String PolyrhythmMIDIProcessor::setMidiOutputIdentifier(const juce::String
 bool PolyrhythmMIDIProcessor::isExternalMidiOutputActive() const noexcept
 {
     return externalMidiWorker != nullptr && externalMidiWorker->active();
+}
+unsigned PolyrhythmMIDIProcessor::getExternalMidiDroppedEvents() const noexcept
+{
+    return externalMidiWorker != nullptr
+        ? externalMidiWorker->droppedEvents.load(std::memory_order_relaxed) : 0u;
 }
 PolyrhythmMIDIProcessor::~PolyrhythmMIDIProcessor() = default;
 
@@ -139,14 +163,28 @@ PolyrhythmMIDIProcessor::PolyrhythmMIDIProcessor()
         laneDivisions[row].store(2);
         laneTimings[row].store(0);
         laneCurrentSteps[row].store(-1);
+        laneStartSteps[row].store(0, std::memory_order_relaxed);
         for (int i = 0; i < maxSteps; ++i)
             laneValues[row][i].store(row == channelLane || row == 1 || row == 4 || row == 5 || row == 6 || row >= 7 ? (getOptionalLaneType(row) == 4 ? 64 : 0) : row == 2 ? 70 : row == 3 ? 50 : 80);
     }
 
+    for (int row = 0; row < laneCount; ++row)
+    {
+        const auto suffix = juce::String(row);
+        hostedDivisions[row] = parameters.getRawParameterValue("pn_lane_div_" + suffix);
+        hostedTimings[row] = parameters.getRawParameterValue("pn_lane_timing_" + suffix);
+        hostedDirections[row] = parameters.getRawParameterValue("pn_lane_direction_" + suffix);
+        laneResetParameters[row] = parameters.getRawParameterValue("pn_lane_restart_" + suffix);
+        previousLaneResetCounters[row] = getLaneResetCounter(row);
+        publishedLanePhaseOrigins[row].store(0.0, std::memory_order_relaxed);
+    }
+    previousResetCounter = getResetCounter();
     // Restore the familiar original 16-step pattern.
     for (int i = 0; i < 16; i += 2)
         pattern[static_cast<size_t>(i)].store(
             true, std::memory_order_relaxed);
+    captureCurrentProgram(factoryProgram);
+    startTimerHz(60); // Hardware/host program requests, message thread only.
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout
@@ -164,10 +202,10 @@ PolyrhythmMIDIProcessor::createParameterLayout()
     addInt("pn_clock", "Global Clock", 0, 4, 2);
     addInt("pn_channel", "Default MIDI Channel", 1, 16, 1);
     addInt("pn_bend", "Pitch Bend Range", 0, 3, 2);
-    addInt("pn_darkness", "Darkness", 0, 75, 0);
+    addInt("pn_darkness", "Dark Mode Amount", 0, 75, 0);
     addInt("pn_theme", "Colour Theme", 0, 7, 0);
     addInt("pn_key", "Key", 0, 11, 0);
-    addInt("pn_scale", "Scale", 0, 13, 0);
+    addInt("pn_scale", "Scale", 0, 13, PnordeProjectVersion::newInstanceMajorScale);
     layout.add(std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID { "pn_animations", 1 }, "Lighting Animations", true));
     // Append, NEVER insert, host-visible parameters: protects older automation indices.
@@ -184,11 +222,84 @@ PolyrhythmMIDIProcessor::createParameterLayout()
     // Append-only IDs: do not renumber older Live automation parameters.
     addInt("pn_micro_mode", "EDO Output Mode", 0, 2, 0);
     addInt("pn_poly_pressure", "Experimental Poly Aftertouch", 0, 1, 0);
+    // Append-only automation IDs. Keep old pn_octave (-2..2) normalisation.
+    addInt("pn_octave_v2", "Global Octave Expanded", -3, 3, 0);
+    addInt("pn_octave_v2_active", "Expanded Octave Active", 0, 1, 0);
+    addInt("pn_play_enabled", "PNORDE Play", 0, 1, 1);
+    addInt("pn_reset_counter", "PNORDE Reset Trigger", 0, 127, 0);
+    for (int row=0; row<laneCount; ++row)
+    {
+        addInt(("pn_lane_div_"+std::to_string(row)).c_str(),
+               ("Lane "+std::to_string(row+1)+" Clock Division").c_str(),0,10,2);
+        addInt(("pn_lane_timing_"+std::to_string(row)).c_str(),
+               ("Lane "+std::to_string(row+1)+" Timing").c_str(),0,2,0);
+        addInt(("pn_lane_direction_"+std::to_string(row)).c_str(),
+               ("Lane "+std::to_string(row+1)+" Direction").c_str(),0,2,0);
+    }
+    // v0.6.1: append at the end to preserve the index/order of all v0.6.0 automation.
+    addInt("pn_vibes_bleed", "HPPD Main-Area Bleed", 0, 50, 25);
+    for (int row = 0; row < laneCount; ++row)
+        addInt(("pn_lane_restart_" + std::to_string(row)).c_str(),
+               ("Restart Lane " + std::to_string(row + 1) + " Trigger").c_str(),
+               0, 127, 0);
+    // v0.6.7 append-only automation ID: never reorder earlier parameters.
+    addInt("pn_hppd_fps", "HPPD Frames Per Second", 1, 60, 12);
+    // v0.6.9: extension slot 0=legacy colour, 1..4=new appended themes.
+    // Never change pn_theme's original 0..7 normalised range.
+    addInt("pn_theme_extension", "Colour Theme Extension", 0, 4, 0);
+    addInt("pn_hypnosis", "HPPD Glow Strength", 0, 100, 100);
+    // Append only: existing pn_lane_direction_0..20 IDs keep their values/indices.
+    addInt("pn_global_reverse", "Global Reverse", 0, 1, 0);
+    // v0.6.15: append-only. MIDI mapping/Live Configure -> 0..3.
+    addInt("pn_program_slot", "PNORDE Quick Program", 0, 3, 0);
     return layout;
 }
 
 namespace
 {
+// JUCE APVTS saves parameter values in child ValueTrees identified by `id`
+// (typically <PARAM id="..." value="..."/>), not as root properties.
+// Keep compatibility with older/root-property representations as well.
+juce::ValueTree pnordeFindSavedParameter(const juce::ValueTree& tree,
+                                         const juce::String& parameterId)
+{
+    for (int i = 0; i < tree.getNumChildren(); ++i)
+    {
+        auto child = tree.getChild(i);
+        if (child.getProperty("id").toString() == parameterId)
+            return child;
+    }
+    return {};
+}
+
+bool pnordeSavedParameterExists(const juce::ValueTree& tree,
+                                const juce::String& parameterId)
+{
+    return tree.hasProperty(juce::Identifier(parameterId)) ||
+           pnordeFindSavedParameter(tree, parameterId).isValid();
+}
+
+// Preserve a live host parameter when loading a musical program. Copy its
+// actual APVTS child value; adding a same-named root property alone has no
+// effect on the plug-in parameter and previously caused selection snap-back.
+void pnordeKeepLiveParameter(juce::ValueTree& scene,
+                             const juce::ValueTree& live,
+                             const juce::String& parameterId)
+{
+    const auto liveChild = pnordeFindSavedParameter(live, parameterId);
+    if (liveChild.isValid())
+    {
+        auto sceneChild = pnordeFindSavedParameter(scene, parameterId);
+        if (sceneChild.isValid())
+            sceneChild.copyPropertiesFrom(liveChild, nullptr);
+        else
+            scene.addChild(liveChild.createCopy(), -1, nullptr);
+    }
+    const auto property = juce::Identifier(parameterId);
+    if (live.hasProperty(property))
+        scene.setProperty(property, live.getProperty(property), nullptr);
+}
+
 void pnordeSetAutomatable(juce::AudioProcessorValueTreeState& tree,
                          const char* id, int value)
 {
@@ -204,13 +315,29 @@ void PolyrhythmMIDIProcessor::setAnimationsEnabled(bool b) noexcept
 void PolyrhythmMIDIProcessor::setDefaultMidiChannel(int v) noexcept
 { pnordeSetAutomatable(parameters, "pn_channel", juce::jlimit(1, 16, v)); }
 void PolyrhythmMIDIProcessor::setGlobalOctave(int v) noexcept
-{ pnordeSetAutomatable(parameters, "pn_octave", juce::jlimit(-2, 2, v)); }
+{
+    pnordeSetAutomatable(parameters, "pn_octave_v2", juce::jlimit(-3,3,v));
+    pnordeSetAutomatable(parameters, "pn_octave_v2_active", 1);
+}
 void PolyrhythmMIDIProcessor::setGlobalClockIndex(int v) noexcept
 { pnordeSetAutomatable(parameters, "pn_clock", juce::jlimit(0, 4, v)); }
 void PolyrhythmMIDIProcessor::setBendRangeIndex(int v) noexcept
 { pnordeSetAutomatable(parameters, "pn_bend", juce::jlimit(0, 3, v)); }
 void PolyrhythmMIDIProcessor::setThemeIndex(int v) noexcept
-{ pnordeSetAutomatable(parameters, "pn_theme", juce::jlimit(0, 7, v)); }
+{
+    v = juce::jlimit(0, 11, v);
+    // Both IDs remain appended/unchanged so existing Ableton automation IDs
+    // and old saved theme selections are not reinterpreted.
+    if (v >= 8)
+        pnordeSetAutomatable(parameters, "pn_theme_extension", v - 7);
+    else
+    {
+        pnordeSetAutomatable(parameters, "pn_theme_extension", 0);
+        pnordeSetAutomatable(parameters, "pn_theme", v);
+    }
+}
+void PolyrhythmMIDIProcessor::setHypnosis(int n) noexcept
+{ pnordeSetAutomatable(parameters, "pn_hypnosis", juce::jlimit(0, 100, n)); }
 void PolyrhythmMIDIProcessor::setKey(int v) noexcept
 { pnordeSetAutomatable(parameters, "pn_key", juce::jlimit(0, 11, v)); }
 void PolyrhythmMIDIProcessor::setScale(int v) noexcept
@@ -231,7 +358,10 @@ void PolyrhythmMIDIProcessor::setScale(int v) noexcept
             pnordeSetAutomatable(parameters, "pn_scale", v);
         }
         else
+        {
+            pnordeSetAutomatable(parameters, "pn_scale", 0);
             pnordeSetAutomatable(parameters, "pn_scale_ex", v - (PnordeScales::legacyCount - 1));
+        }
     }
 }
 void PolyrhythmMIDIProcessor::setMicroOutputMode(int mode) noexcept
@@ -256,6 +386,15 @@ void PolyrhythmMIDIProcessor::prepareToPlay(
 {
     currentSampleRate = sampleRate;
     noteIsActive = false;
+    previousPlayEnabled = getPlayEnabled();
+    previousResetCounter = getResetCounter();
+    retainedBeatPpq = 0.0;
+    for (int row = 0; row < laneCount; ++row)
+    {
+        lanePhaseOrigins[row] = 0.0;
+        publishedLanePhaseOrigins[row].store(0.0, std::memory_order_relaxed);
+        previousLaneResetCounters[row] = getLaneResetCounter(row);
+    }
     previousBlockWasPlaying = false;
     previousManualMode = false;
     manualBlockEndPpq = previousHostBlockEndPpq = 0.0;
@@ -281,6 +420,7 @@ void PolyrhythmMIDIProcessor::prepareToPlay(
     dedicatedSent.fill(-1); dedicatedSentChannel.fill(-1);
     for (auto& step : laneCurrentSteps) step.store(-1);
     currentStep.store(-1, std::memory_order_relaxed);
+    globalReversePhase.reset(getGlobalReverse());
     hostPlaying.store(false, std::memory_order_relaxed);
     hostPpq.store(0.0, std::memory_order_relaxed);
     hostClockUpdateMs.store(0.0, std::memory_order_relaxed);
@@ -303,8 +443,47 @@ bool PolyrhythmMIDIProcessor::isBusesLayoutSupported(
 }
 
 void PolyrhythmMIDIProcessor::requestPlay()
+{ setPlayEnabled(true); }
+void PolyrhythmMIDIProcessor::setPlayEnabled(bool enabled) noexcept
+{ pnordeSetAutomatable(parameters,"pn_play_enabled",enabled ? 1 : 0); }
+void PolyrhythmMIDIProcessor::requestSequenceReset() noexcept
+{ pnordeSetAutomatable(parameters,"pn_reset_counter", (getResetCounter()+1)%128); }
+int PolyrhythmMIDIProcessor::getLaneResetCounter(int row) const noexcept
 {
-    // Ableton's transport controls playback.
+    if (row < 0 || row >= laneCount || laneResetParameters[row] == nullptr) return 0;
+    return juce::jlimit(0,127, static_cast<int>(laneResetParameters[row]->load(std::memory_order_relaxed)));
+}
+void PolyrhythmMIDIProcessor::requestLaneReset(int row) noexcept
+{
+    if (row < 0 || row >= laneCount) return;
+    const auto id = "pn_lane_restart_" + juce::String(row);
+    if (auto* parameter = parameters.getParameter(id))
+        parameter->setValueNotifyingHost(parameter->convertTo0to1(
+            static_cast<float>((getLaneResetCounter(row) + 1) % 128)));
+}
+double PolyrhythmMIDIProcessor::getLanePhaseOrigin(int row) const noexcept
+{
+    return row >= 0 && row < laneCount
+        ? publishedLanePhaseOrigins[row].load(std::memory_order_relaxed) : 0.0;
+}
+void PolyrhythmMIDIProcessor::setHppdFps(int fps) noexcept
+{ pnordeSetAutomatable(parameters, "pn_hppd_fps", juce::jlimit(1,60,fps)); }
+void PolyrhythmMIDIProcessor::setVibesBleed(int amount) noexcept
+{ pnordeSetAutomatable(parameters, "pn_vibes_bleed", juce::jlimit(0,50,amount)); }
+void PolyrhythmMIDIProcessor::setGlobalReverse(bool on) noexcept
+{ pnordeSetAutomatable(parameters, "pn_global_reverse", on ? 1 : 0); }
+
+int PolyrhythmMIDIProcessor::getLaneDirection(int row) const noexcept
+{
+    return row>=0 && row<laneCount && hostedDirections[row]!=nullptr
+       ? juce::jlimit(0,2,static_cast<int>(hostedDirections[row]->load(std::memory_order_relaxed))) : 0;
+}
+void PolyrhythmMIDIProcessor::setLaneDirection(int row,int direction) noexcept
+{
+    if (row<0 || row>=laneCount) return;
+    const auto id="pn_lane_direction_"+juce::String(row);
+    if (auto* param=parameters.getParameter(id))
+        param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(juce::jlimit(0,2,direction))));
 }
 
 bool PolyrhythmMIDIProcessor::getStepEnabled(
@@ -340,6 +519,7 @@ void PolyrhythmMIDIProcessor::setSequenceLength(
         juce::jlimit(1, 128, length),
         std::memory_order_relaxed);
     laneLengths[0].store(getSequenceLength(), std::memory_order_relaxed);
+    setLaneStartStep(0, juce::jmin(getLaneStartStep(0), getSequenceLength() - 1));
 }
 
 int PolyrhythmMIDIProcessor::getClockDivisionIndex() const noexcept
@@ -354,6 +534,9 @@ void PolyrhythmMIDIProcessor::setClockDivisionIndex(
         juce::jlimit(0, 10, index),
         std::memory_order_relaxed);
     laneDivisions[0].store(getClockDivisionIndex(), std::memory_order_relaxed);
+    const auto id="pn_lane_div_0";
+    if (auto* param=parameters.getParameter(id))
+        param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(getClockDivisionIndex())));
 }
 
 int PolyrhythmMIDIProcessor::getLaneLength(int row) const noexcept
@@ -364,18 +547,40 @@ void PolyrhythmMIDIProcessor::setLaneLength(int row, int length) noexcept
 {
     if (row < 0 || row >= laneCount) return;
     if (row == 0) { setSequenceLength(length); return; }
-    laneLengths[row].store(juce::jlimit(1, maxSteps, length), std::memory_order_relaxed);
+    const int clamped = juce::jlimit(1, maxSteps, length);
+    laneLengths[row].store(clamped, std::memory_order_relaxed);
+    setLaneStartStep(row, juce::jmin(getLaneStartStep(row), clamped - 1));
 }
 int PolyrhythmMIDIProcessor::getLaneDivision(int row) const noexcept
 {
-    return row >= 0 && row < laneCount ? laneDivisions[row].load(std::memory_order_relaxed) : 2;
+    return row>=0 && row<laneCount && hostedDivisions[row]!=nullptr
+        ? juce::jlimit(0,10,static_cast<int>(hostedDivisions[row]->load(std::memory_order_relaxed))) : 2;
 }
 void PolyrhythmMIDIProcessor::setLaneDivision(int row, int division) noexcept
 {
     if (row < 0 || row >= laneCount) return;
-    if (row == 0) { setClockDivisionIndex(division); return; }
-    laneDivisions[row].store(juce::jlimit(0, 10, division), std::memory_order_relaxed);
+    division=juce::jlimit(0,10,division);
+    laneDivisions[row].store(division,std::memory_order_relaxed);
+    const auto id="pn_lane_div_"+juce::String(row);
+    if (auto* param=parameters.getParameter(id))
+        param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(division)));
+    if (row==0) clockDivisionIndex.store(division,std::memory_order_relaxed);
 }
+int PolyrhythmMIDIProcessor::getLaneStartStep(int row) const noexcept
+{
+    if (row < 0 || row >= laneCount) return 0;
+    return juce::jlimit(0, juce::jmax(0, getLaneLength(row) - 1),
+        laneStartSteps[static_cast<size_t>(row)].load(std::memory_order_relaxed));
+}
+
+void PolyrhythmMIDIProcessor::setLaneStartStep(int row, int step) noexcept
+{
+    if (row < 0 || row >= laneCount) return;
+    laneStartSteps[static_cast<size_t>(row)].store(
+        juce::jlimit(0, juce::jmax(0, getLaneLength(row) - 1), step),
+        std::memory_order_relaxed);
+}
+
 int PolyrhythmMIDIProcessor::getLaneValue(int row, int step) const noexcept
 {
     if (row < 1 || row >= laneCount || step < 0 || step >= maxSteps) return 0;
@@ -438,7 +643,12 @@ void PolyrhythmMIDIProcessor::deletePage(int row, int page) noexcept
             if (getOptionalLaneType(row) == 3) setVibratoDepth(i, 0);
         }
     }
+    const int oldStart = getLaneStartStep(row);
     setLaneLength(row, juce::jmax(1, length - removed));
+    if (oldStart >= start + removed)
+        setLaneStartStep(row, oldStart - removed);
+    else if (oldStart >= start)
+        setLaneStartStep(row, start);
 }
 void PolyrhythmMIDIProcessor::appendPage(int row) noexcept
 {
@@ -557,6 +767,8 @@ void PolyrhythmMIDIProcessor::removeOptionalLane(int row) noexcept
             displayOrder[i].store(order[i], std::memory_order_relaxed);
         return;
     }
+    setLaneName(row, {});
+    setLaneStartStep(row, 0);
     const int previousKind = getOptionalLaneType(row);
     if (row == channelLane) setMidiChannelLaneEnabled(false);
     else setDedicatedEnabled(row, false);
@@ -643,6 +855,20 @@ void PolyrhythmMIDIProcessor::setCustomCCLabel(int slot, const juce::String& lab
     const juce::SpinLock::ScopedLockType lock(customCCLabelsLock);
     customCCLabels[static_cast<size_t>(slot)] = label.substring(0, 12);
 }
+juce::String PolyrhythmMIDIProcessor::getLaneName(int row) const
+{
+    if (!juce::isPositiveAndBelow(row, laneCount)) return {};
+    const juce::SpinLock::ScopedLockType lock(customCCLabelsLock);
+    return customLaneNames[static_cast<size_t>(row)];
+}
+void PolyrhythmMIDIProcessor::setLaneName(int row, const juce::String& name)
+{
+    if (!juce::isPositiveAndBelow(row, laneCount)) return;
+    // Bounded names; never called from the audio callback. No MIDI impact.
+    const auto clean = name.trim().substring(0, 24).removeCharacters("\r\n\t");
+    const juce::SpinLock::ScopedLockType lock(customCCLabelsLock);
+    customLaneNames[static_cast<size_t>(row)] = clean;
+}
 int PolyrhythmMIDIProcessor::getOptionalGlide(int row, int step) const noexcept
 {
     if (row < baseLanes || row >= laneCount || !juce::isPositiveAndBelow(step, maxSteps)) return 0;
@@ -680,8 +906,10 @@ void PolyrhythmMIDIProcessor::removeCustomCC(int slot) noexcept
             setOptionalGlide(i + baseLanes, j, getOptionalGlide(i + baseLanes + 1, j));
         }
         setCustomCCLabel(i, getCustomCCLabel(i + 1));
+        setLaneName(i + baseLanes, getLaneName(i + baseLanes + 1));
         const int dest = i + baseLanes, src = dest + 1;
         laneLengths[dest].store(laneLengths[src].load());
+        setLaneStartStep(dest, getLaneStartStep(src));
         laneDivisions[dest].store(laneDivisions[src].load());
         laneTimings[dest].store(laneTimings[src].load());
         for (int j = 0; j < maxSteps; ++j) laneValues[dest][j].store(laneValues[src][j].load());
@@ -689,6 +917,8 @@ void PolyrhythmMIDIProcessor::removeCustomCC(int slot) noexcept
     if (getOptionalLaneType(baseLanes + count - 1) == 3)
         for (int step = 0; step < maxSteps; ++step) setVibratoDepth(step, 0);
     setCustomCCLabel(count - 1, {});
+    setLaneName(count - 1 + baseLanes, {});
+    setLaneStartStep(count - 1 + baseLanes, 0);
     setMacroType(count - 1, 0);
     laneTypes[count - 1].store(0);
     setMacroChannel(count - 1, 0);
@@ -702,12 +932,17 @@ void PolyrhythmMIDIProcessor::removeCustomCC(int slot) noexcept
 
 int PolyrhythmMIDIProcessor::getLaneTiming(int row) const noexcept
 {
-    return row >= 0 && row < laneCount ? laneTimings[row].load(std::memory_order_relaxed) : 0;
+    return row>=0 && row<laneCount && hostedTimings[row]!=nullptr
+        ? juce::jlimit(0,2,static_cast<int>(hostedTimings[row]->load(std::memory_order_relaxed))) : 0;
 }
 void PolyrhythmMIDIProcessor::setLaneTiming(int row, int mode) noexcept
 {
-    if (row >= 0 && row < laneCount)
-        laneTimings[row].store(juce::jlimit(0, 2, mode), std::memory_order_relaxed);
+    if (row<0 || row>=laneCount) return;
+    mode=juce::jlimit(0,2,mode);
+    laneTimings[row].store(mode,std::memory_order_relaxed);
+    const auto id="pn_lane_timing_"+juce::String(row);
+    if (auto* param=parameters.getParameter(id))
+        param->setValueNotifyingHost(param->convertTo0to1(static_cast<float>(mode)));
 }
 
 int PolyrhythmMIDIProcessor::getLaneCurrentStep(int row) const noexcept
@@ -786,24 +1021,87 @@ void PolyrhythmMIDIProcessor::processBlock(
         nextModulationPpq = 0.0;
         previousBlockWasPlaying = false;
         previousManualMode = false;
+        globalReversePhase.reset(getGlobalReverse());
         mpeZoneConfigured = false;
         previousMicroMode = -1;
         hostPlaying.store(false, std::memory_order_relaxed);
-        hostPpq.store(0.0, std::memory_order_relaxed);
-    hostClockUpdateMs.store(0.0, std::memory_order_relaxed);
-        currentStep.store(-1, std::memory_order_relaxed);
-        for (auto& s : laneCurrentSteps) s.store(-1, std::memory_order_relaxed);
+        hostPpq.store(retainedBeatPpq, std::memory_order_relaxed);
+        hostClockUpdateMs.store(0.0, std::memory_order_relaxed);
+        // Do not wipe the lane positions. Pausing must preserve each polymetric phase.
     };
 
+    // Trigger counters are absolute host-visible parameters; each change is
+    // a restart impulse (suitable for stepped automation in Ableton).
+    // Consume while paused too, so RESET immediately sets visual positions to 1.
+    const int globalReset = getResetCounter();
+    if (globalReset != previousResetCounter)
+    {
+        previousResetCounter = globalReset;
+        reset();
+        retainedBeatPpq = 0.0;
+        for (int row = 0; row < laneCount; ++row)
+        {
+            lanePhaseOrigins[row] = 0.0;
+            publishedLanePhaseOrigins[row].store(0.0, std::memory_order_relaxed);
+            laneCurrentSteps[row].store(getLaneStartStep(row), std::memory_order_relaxed);
+        }
+        currentStep.store(getLaneStartStep(0), std::memory_order_relaxed);
+        hostPpq.store(0.0, std::memory_order_relaxed);
+    }
+    // Individual restarts are applied below when audio starts, or immediately
+    // here when paused. The actual phase-origin adjustment is sample-block exact.
+    const bool canAdvance = getPlayEnabled();
+    if (!canAdvance)
+    {
+        for (int row = 0; row < laneCount; ++row)
+        {
+            const int counter = getLaneResetCounter(row);
+            if (counter == previousLaneResetCounters[row]) continue;
+            previousLaneResetCounters[row] = counter;
+            lanePhaseOrigins[row] = retainedBeatPpq;
+            publishedLanePhaseOrigins[row].store(retainedBeatPpq, std::memory_order_relaxed);
+            laneCurrentSteps[row].store(getLaneStartStep(row), std::memory_order_relaxed);
+            if (row == 0) currentStep.store(getLaneStartStep(0), std::memory_order_relaxed);
+        }
+    }
+    if (!canAdvance)
+    {
+        if (previousPlayEnabled) reset();
+        previousPlayEnabled = false;
+        return;
+    }
+    previousPlayEnabled = true;
+    // Host stop can span thousands of audio callbacks. Reset MIDI just once
+    // instead of emitting redundant pressure resets every silent buffer.
+    const auto stopIfNecessary = [&]()
+    {
+        if (previousBlockWasPlaying || noteIsActive) reset();
+        else hostPlaying.store(false, std::memory_order_relaxed);
+    };
     const auto* playhead = getPlayHead();
-    if (playhead == nullptr) { reset(); return; }
+    if (playhead == nullptr) { stopIfNecessary(); return; }
     const auto position = playhead->getPosition();
-    if (!position.hasValue() || !position->getIsPlaying()) { reset(); return; }
+    if (!position.hasValue() || !position->getIsPlaying())
+    {
+        // Keep user lane resets responsive even when the DAW is stopped.
+        for (int row = 0; row < laneCount; ++row)
+        {
+            const int counter = getLaneResetCounter(row);
+            if (counter == previousLaneResetCounters[row]) continue;
+            previousLaneResetCounters[row] = counter;
+            lanePhaseOrigins[row] = retainedBeatPpq;
+            publishedLanePhaseOrigins[row].store(retainedBeatPpq, std::memory_order_relaxed);
+            laneCurrentSteps[row].store(getLaneStartStep(row), std::memory_order_relaxed);
+            if (row == 0) currentStep.store(getLaneStartStep(0), std::memory_order_relaxed);
+        }
+        stopIfNecessary(); return;
+    }
     const auto ppq = position->getPpqPosition();
     const auto bpm = position->getBpm();
     if (!ppq.hasValue() || !bpm.hasValue() || !std::isfinite(*ppq) ||
         std::abs(*ppq) > 1.0e12 || !std::isfinite(*bpm) || *bpm > 1000.0 ||
-        *bpm <= 0.0 || !std::isfinite(currentSampleRate) || currentSampleRate <= 0.0) { reset(); return; }
+        *bpm <= 0.0 || !std::isfinite(currentSampleRate) || currentSampleRate <= 0.0)
+    { stopIfNecessary(); return; }
 
     constexpr double divisions[] {0.125, 0.25, 0.5, 1.0, 2.0, 4.0,
                                    8.0, 16.0, 32.0, 64.0, 128.0};
@@ -827,9 +1125,79 @@ void PolyrhythmMIDIProcessor::processBlock(
         previousHostBlockEndPpq, manualBlockEndPpq
     });
     const double effectiveBpm = beats.bpm;
-    const double start = beats.start;
-    const double end = beats.end;
     const double perSample = effectiveBpm / (60.0 * currentSampleRate);
+    // Independent local beat clock: Ableton can stop, pause or seek without
+    // moving the retained lane phases. Tempo changes still take effect immediately.
+    const double start = retainedBeatPpq;
+    const double end = PnordeRetainedTransport::endOfBlock(start, effectiveBpm, numSamples, currentSampleRate);
+    retainedBeatPpq = end;
+    // Dedicated PROGRAM lane is independent of the 21 musical lanes and
+    // continues across scene changes. Trigger at the END of a cell; publish
+    // ONLY a tiny atomic request, never XML or locks on the audio thread.
+    // Message thread commits the bank at its next timer tick (~16.7 ms).
+    if (programLaneRestartRequested.exchange(false, std::memory_order_acq_rel))
+    {
+        // Message/host state thread never writes the audio thread's doubles.
+        programLaneBeat = 0.0;
+        programLaneOrigin = 0.0;
+        lastProgramLaneBoundary = -1.0;
+    }
+    const double progStart = programLaneBeat;
+    const double progEnd = progStart + (end - start);
+    programLaneBeat = progEnd;
+    const double programDuration = divisions[getProgramLaneDivision()] *
+        timing[getProgramLaneTiming()] * clockMultiplier;
+    if (getProgramLaneEnabled() && std::isfinite(programDuration) && programDuration > 1.0e-9)
+    {
+        const auto firstTick = PnordeRetainedTransport::nextBoundaryTick(progStart,
+            programLaneOrigin, programDuration);
+        const auto lastTick = PnordeRetainedTransport::nextBoundaryTick(progEnd,
+            programLaneOrigin, programDuration);
+        // Bound iteration for pathological host blocks or tempo values.
+        for (auto t = firstTick; t < lastTick && t < firstTick + 256; ++t)
+        {
+            const double at = PnordeRetainedTransport::boundaryAt(t,
+                programLaneOrigin, programDuration);
+            if (t <= 0 || at < progStart - 1.0e-9 || at >= progEnd - 1.0e-9 ||
+                at <= lastProgramLaneBoundary + 1.0e-9) continue;
+            lastProgramLaneBoundary = at;
+            const int outgoing = PnordeProgramLane::completedIndex(
+                t, getProgramLaneLength(), getProgramLaneStart());
+            const int slot = getProgramLaneValue(outgoing);
+            if (getProgramLaneAutoArmed() && slot >= 1 && slot <= programCount)
+                pendingSequencedProgram.store(PnordeProgramRequests::pack(
+                    manualProgramEpoch.load(std::memory_order_acquire), slot),
+                    std::memory_order_release);
+        }
+        const auto currentTick = PnordeRetainedTransport::tickAt(progEnd,
+            programLaneOrigin, programDuration);
+        const int len = getProgramLaneLength();
+        programLaneCurrent.store(PnordeProgramLane::activeIndex(
+            currentTick, len, getProgramLaneStart()), std::memory_order_relaxed);
+        const double distance = (progEnd - programLaneOrigin) / programDuration;
+        programLaneProgress.store(static_cast<float>(juce::jlimit(0.0, 1.0,
+            distance - std::floor(distance))), std::memory_order_relaxed);
+    }
+    for (int row = 0; row < laneCount; ++row)
+    {
+        const int counter = getLaneResetCounter(row);
+        if (counter == previousLaneResetCounters[row]) continue;
+        previousLaneResetCounters[row] = counter;
+        lanePhaseOrigins[row] = start;
+        globalReversePhase.resetLane(row);
+        publishedLanePhaseOrigins[row].store(start, std::memory_order_relaxed);
+        laneCurrentSteps[row].store(getLaneStartStep(row), std::memory_order_relaxed);
+        if (row == 0)
+        {
+            // Re-phasing SEQ also ends its currently sounding note safely.
+            noteOff(0);
+            currentStep.store(getLaneStartStep(0), std::memory_order_relaxed);
+            nextModulationPpq = start;
+            hadPreviousPitch = false;
+        }
+        lastCCStep.fill(-1);
+        dedicatedTargetStep.fill(-1);
+    }
     manualBlockEndPpq = beats.end;
     previousHostBlockEndPpq = beats.hostEnd;
     previousManualMode = beats.manualMode;
@@ -850,6 +1218,16 @@ void PolyrhythmMIDIProcessor::processBlock(
         glideStartPpq = glideEndPpq = start;
         pressureStartPpq = pressureEndPpq = start;
     }
+    // Live global reversal: preserve each lane's currently sounding cell by
+    // reflecting its independent tick coordinate at this block boundary.
+    // Applied once per block; host automation is block-quantised, never MIDI CC.
+    {
+        std::array<std::int64_t, laneCount> currentTicks {};
+        for (int row = 0; row < laneCount; ++row)
+            currentTicks[static_cast<size_t>(row)] = PnordeRetainedTransport::tickAt(
+                start, lanePhaseOrigins[row], laneDuration(row));
+        globalReversePhase.update(getGlobalReverse(), currentTicks);
+    }
     previousBlockWasPlaying = true;
     previousBlockEndPpq = end;
 
@@ -860,9 +1238,10 @@ void PolyrhythmMIDIProcessor::processBlock(
     };
     const auto stepAt = [&](int row, double at)
     {
-        const auto tick = static_cast<juce::int64>(std::floor(at / laneDuration(row) + eps));
-        const int len = getLaneLength(row);
-        return static_cast<int>((tick % len + len) % len);
+        const auto tick = PnordeRetainedTransport::tickAt(
+            at, lanePhaseOrigins[row], laneDuration(row));
+        return PnordePlayback::indexWithStart(globalReversePhase.position(row, tick),
+            getLaneLength(row), getLaneDirection(row), getLaneStartStep(row));
     };
     const auto interpolated = [](double at, double t0, double t1, double from, double to)
     {
@@ -1043,16 +1422,21 @@ void PolyrhythmMIDIProcessor::processBlock(
 
     const double seqDuration = laneDuration(0);
     const int seqLength = getLaneLength(0);
-    auto tick = static_cast<juce::int64>(std::ceil(start / seqDuration - eps));
-    double boundary = tick * seqDuration;
+    const double seqOrigin = lanePhaseOrigins[0];
+    auto tick = PnordeRetainedTransport::nextBoundaryTick(start, seqOrigin, seqDuration);
+    double boundary = PnordeRetainedTransport::boundaryAt(tick, seqOrigin, seqDuration);
     // 200 Hz bend/pressure sampling; event offsets remain sample-accurate.
     const double modInterval = juce::jmax(perSample, effectiveBpm / 12000.0);
     if (nextModulationPpq < start || nextModulationPpq > end + 1.0)
         nextModulationPpq = start;
 
     // Merge trigger, gate-off and modulation events chronologically.
+    // A malformed host block, extreme tempo automation or scheduler regression
+    // must not spin for 200,000 iterations on the real-time audio thread.
+    const int iterationBudget = juce::jlimit(128, 32768,
+        juce::jmin(numSamples, 4096) * 8);
     int guard = 0;
-    while (++guard < 200000)
+    while (++guard < iterationBudget)
     {
         const double offTime = noteIsActive ? noteOffPpq : end + 1.0;
         const double modTime = nextModulationPpq;
@@ -1072,7 +1456,9 @@ void PolyrhythmMIDIProcessor::processBlock(
             const int offset = offsetAt(boundary);
             if (noteIsActive) sendModulation(boundary);
             const bool voiceAtBoundary = noteIsActive;
-            const int index = static_cast<int>((tick % seqLength + seqLength) % seqLength);
+            const int index = PnordePlayback::indexWithStart(
+                globalReversePhase.position(0, tick), seqLength,
+                getLaneDirection(0), getLaneStartStep(0));
             currentStep.store(index, std::memory_order_relaxed);
             if (getStepEnabled(index))
             {
@@ -1087,7 +1473,7 @@ void PolyrhythmMIDIProcessor::processBlock(
                     ? PnordeEDO::quantiseSemitones(rawPitch,octave,getKey(),getScale())
                     : tenths / 10.0;
                 const double targetSemis = juce::jlimit(0.0,127.0,
-                    60.0+(octave+getGlobalOctave())*12.0+fineTenths);
+                    (getLowPitchAnchor()?48.0:60.0)+(octave+getGlobalOctave())*12.0+fineTenths);
                 const int newNote = juce::jlimit(0, 127,
                     static_cast<int>(std::lround(targetSemis)));
                 lastEDOOffsetCents.store(microtonal
@@ -1166,7 +1552,7 @@ void PolyrhythmMIDIProcessor::processBlock(
             }
             else if (noteIsActive) noteOff(offset);
             ++tick;
-            boundary = tick * seqDuration;
+            boundary = PnordeRetainedTransport::boundaryAt(tick, seqOrigin, seqDuration);
             continue;
         }
         if (modTime <= nextTime + eps)
@@ -1176,6 +1562,14 @@ void PolyrhythmMIDIProcessor::processBlock(
             continue;
         }
         break;
+    }
+    if (guard >= iterationBudget)
+    {
+        // Fail closed rather than hanging the DAW or leaving a voice held.
+        noteOff(numSamples - 1);
+        nextModulationPpq = end;
+        lastCCStep.fill(-1);
+        dedicatedTargetStep.fill(-1);
     }
     const double lastPpq = start + (numSamples - 1) * perSample;
     for (int row = 0; row < laneCount; ++row)
@@ -1192,7 +1586,7 @@ PolyrhythmMIDIProcessor::createEditor()
     return new PolyrhythmMIDIEditor(*this);
 }
 
-void PolyrhythmMIDIProcessor::getStateInformation(
+void PolyrhythmMIDIProcessor::captureCurrentProgram(
     juce::MemoryBlock& destData)
 {
     auto state = parameters.copyState();
@@ -1212,8 +1606,42 @@ void PolyrhythmMIDIProcessor::getStateInformation(
     state.setProperty(
         "NovaClockDivision", getClockDivisionIndex(), nullptr);
 
+    // New project-state version marker: keeps new instances Major while giving
+    // genuinely old, unversioned projects their original Free 0.1 behaviour.
+    // Save it with host state/presets so moving machines requires no registry.
+    state.setProperty("PnordeStateSchema", PnordeProjectVersion::schema, nullptr);
+    state.setProperty("PnordeSavedBuild", PnordeProjectVersion::build, nullptr);
+    state.setProperty("PnordeSavedPluginVersion", PnordeProjectVersion::release, nullptr);
+    // Each bank snapshot owns all PROGRAM lane musical data, so scene reset,
+    // copy and ordinary preset save/load have independent trigger patterns.
+    state.setProperty("PnordeProgramLaneLength", getProgramLaneLength(), nullptr);
+    state.setProperty("PnordeProgramLaneDivision", getProgramLaneDivision(), nullptr);
+    state.setProperty("PnordeProgramLaneTiming", getProgramLaneTiming(), nullptr);
+    state.setProperty("PnordeProgramLaneStart", getProgramLaneStart(), nullptr);
+    juce::String programValues;
+    for (int n = 0; n < maxSteps; ++n)
+    {
+        if (n != 0) programValues += ",";
+        programValues += juce::String(getProgramLaneValue(n));
+    }
+    state.setProperty("PnordeProgramLaneValues", programValues, nullptr);
+    state.setProperty("PnordeHppdFps", getHppdFps(), nullptr);
+    state.setProperty("PnordeHypnosis", getHypnosis(), nullptr);
+    state.setProperty("PnordeVisualGlowEnabled", getVisualGlowEnabled(), nullptr);
+    for (int row = 0; row < laneCount; ++row)
+    {
+        state.setProperty("PnordeLaneName" + juce::String(row), getLaneName(row), nullptr);
+        state.setProperty("PnordeLaneStart" + juce::String(row), getLaneStartStep(row), nullptr);
+    }
+
     // Versioned lane data; older saved projects still load the original SEQ properties.
-    state.setProperty("NovaLaneDataVersion", 12, nullptr);
+    state.setProperty("NovaLaneDataVersion", 13, nullptr);
+    state.setProperty("PnordePitchAnchorLow", getLowPitchAnchor(), nullptr);
+    state.setProperty("PnordeOctaveV2Used", parameters.getRawParameterValue("pn_octave_v2_active")->load()>=0.5f,nullptr);
+    state.setProperty("PnordePsychedelicEnabled",getPsychedelicEnabled(),nullptr);
+    state.setProperty("PnordePsychedelicIntensity",getPsychedelicIntensity(),nullptr);
+    state.setProperty("PnordeVibesBleed",getVibesBleed(),nullptr);
+    state.setProperty("PnordeVibesMode",getVibesMode(),nullptr);
     state.setProperty("PnordeAftertouchGlideUnits", 1, nullptr); // New tempo percentage units
     state.setProperty("PnordeExperimentalReorder", getExperimentalReorderEnabled(), nullptr);
     state.setProperty("PnordeMicroMode", getMicroOutputMode(), nullptr);
@@ -1282,6 +1710,7 @@ void PolyrhythmMIDIProcessor::getStateInformation(
         state.setProperty(prefix + "Length", getLaneLength(row), nullptr);
         state.setProperty(prefix + "Division", getLaneDivision(row), nullptr);
         state.setProperty(prefix + "Timing", getLaneTiming(row), nullptr);
+        state.setProperty(prefix + "Direction", getLaneDirection(row), nullptr);
         juce::String values;
         for (int i = 0; i < maxSteps; ++i)
         {
@@ -1303,6 +1732,279 @@ void PolyrhythmMIDIProcessor::getStateInformation(
         copyXmlToBinary(*xml, destData);
 }
 
+
+
+// Performance appearance is intentionally GLOBAL. Host and preset project
+// restore may change it, but selecting a musical program cannot.
+bool PolyrhythmMIDIProcessor::restoreProgramSnapshot(const juce::MemoryBlock& snapshot, int destination)
+{
+    // Do NOT load a scene's old theme/darkness/HPPD parameters then change
+    // them back. APVTS replacement may notify Live and momentarily render the
+    // wrong scene appearance, even when the final values seem correct.
+    // Instead overwrite visual-only fields in a PRIVATE snapshot before
+    // the normal validated loader sees it. Musical fields remain untouched.
+    std::unique_ptr<juce::XmlElement> input(getXmlFromBinary(
+        snapshot.getData(), static_cast<int>(snapshot.getSize())));
+    if (!input || !input->hasTagName(parameters.state.getType())) return false;
+    auto scene = juce::ValueTree::fromXml(*input);
+    if (!scene.isValid()) return false;
+    const auto liveParameters = parameters.copyState();
+    // Keep display controls GLOBAL while also pinning the host's Quick
+    // Program parameter. All these are APVTS child nodes, not root properties.
+    // Deliberately DO NOT preserve pn_global_reverse: it belongs to each scene.
+    for (const char* key : {"pn_darkness", "pn_theme", "pn_theme_extension",
+                            "pn_animations", "pn_vibes_bleed", "pn_hppd_fps",
+                            "pn_hypnosis", "pn_program_slot"})
+        pnordeKeepLiveParameter(scene, liveParameters, key);
+
+    scene.setProperty("PnordeTheme", getThemeIndex(), nullptr);
+    scene.setProperty("PnordeDarknessPercent", getDarknessPercent(), nullptr);
+    scene.setProperty("PnordeAnimations", getAnimationsEnabled(), nullptr);
+    scene.setProperty("PnordeScrollFades", getScrollFadesEnabled(), nullptr);
+    scene.setProperty("PnordeTooltips", getTooltipsEnabled(), nullptr);
+    scene.setProperty("PnordeExperimentalLights", getExperimentalLightsEnabled(), nullptr);
+    scene.setProperty("PnordeVisualGlowEnabled", getVisualGlowEnabled(), nullptr);
+    scene.setProperty("PnordePsychedelicEnabled", getPsychedelicEnabled(), nullptr);
+    scene.setProperty("PnordePsychedelicIntensity", getPsychedelicIntensity(), nullptr);
+    scene.setProperty("PnordeVibesMode", getVibesMode(), nullptr);
+    scene.setProperty("PnordeVibesBleed", getVibesBleed(), nullptr);
+    scene.setProperty("PnordeHypnosis", getHypnosis(), nullptr);
+    scene.setProperty("PnordeHppdFps", getHppdFps(), nullptr);
+    scene.setProperty("PnordeExperimentalReorder", getExperimentalReorderEnabled(), nullptr);
+    scene.setProperty("NovaEditorWidth", getEditorWidth(), nullptr);
+    scene.setProperty("NovaEditorHeight", getEditorHeight(), nullptr);
+    juce::String visualOrder;
+    for (int i = 0; i < optionalCount; ++i)
+    {
+        if (i != 0) visualOrder += ",";
+        visualOrder += juce::String(getDisplayRowAt(i));
+    }
+    scene.setProperty("PnordeVisualOrder", visualOrder, nullptr);
+
+    juce::MemoryBlock adjustedSnapshot;
+    if (auto adjustedXml = std::unique_ptr<juce::XmlElement>(scene.createXml()))
+        copyXmlToBinary(*adjustedXml, adjustedSnapshot);
+    if (adjustedSnapshot.isEmpty()) return false;
+    // The destination is authoritative. Never infer it from the APVTS raw
+    // value while replacing a scene: that was the program snap-back race.
+    snapshotTargetProgram = juce::jlimit(0, programCount - 1, destination);
+    applyingProgramSnapshot = true;
+    const bool success = loadValidatedState(adjustedSnapshot.getData(),
+        static_cast<int>(adjustedSnapshot.getSize()));
+    applyingProgramSnapshot = false;
+    snapshotTargetProgram = -1;
+    return success;
+}
+
+int PolyrhythmMIDIProcessor::getProgramLaneValue(int step) const noexcept
+{
+    return step >= 0 && step < maxSteps
+        ? programLaneCells[static_cast<size_t>(step)].load(std::memory_order_relaxed) : 0;
+}
+void PolyrhythmMIDIProcessor::setProgramLaneValue(int step, int value) noexcept
+{
+    if (step >= 0 && step < maxSteps)
+        programLaneCells[static_cast<size_t>(step)].store(juce::jlimit(0, 4, value), std::memory_order_relaxed);
+}
+int PolyrhythmMIDIProcessor::getProgramLaneLength() const noexcept
+{ return programLaneLength.load(std::memory_order_relaxed); }
+void PolyrhythmMIDIProcessor::setProgramLaneLength(int n) noexcept
+{
+    programLaneLength.store(juce::jlimit(1, maxSteps, n), std::memory_order_relaxed);
+    setProgramLaneStart(getProgramLaneStart());
+}
+int PolyrhythmMIDIProcessor::getProgramLaneDivision() const noexcept
+{ return programLaneDivision.load(std::memory_order_relaxed); }
+void PolyrhythmMIDIProcessor::setProgramLaneDivision(int n) noexcept
+{ programLaneDivision.store(juce::jlimit(0, 10, n), std::memory_order_relaxed); }
+int PolyrhythmMIDIProcessor::getProgramLaneTiming() const noexcept
+{ return programLaneTiming.load(std::memory_order_relaxed); }
+void PolyrhythmMIDIProcessor::setProgramLaneTiming(int n) noexcept
+{ programLaneTiming.store(juce::jlimit(0, 2, n), std::memory_order_relaxed); }
+int PolyrhythmMIDIProcessor::getProgramLaneStart() const noexcept
+{ return programLaneStart.load(std::memory_order_relaxed); }
+void PolyrhythmMIDIProcessor::setProgramLaneStart(int n) noexcept
+{ programLaneStart.store(juce::jlimit(0, getProgramLaneLength() - 1, n), std::memory_order_relaxed); }
+int PolyrhythmMIDIProcessor::getProgramLaneCurrentStep() const noexcept
+{ return programLaneCurrent.load(std::memory_order_relaxed); }
+float PolyrhythmMIDIProcessor::getProgramLaneProgress() const noexcept
+{ return programLaneProgress.load(std::memory_order_relaxed); }
+
+bool PolyrhythmMIDIProcessor::duplicateLanePattern(int row)
+{
+    if (row < 0 || row >= laneCount) return false;
+    const int length = getLaneLength(row);
+    if (length < 1 || length > maxSteps / 2) return false;
+    for (int i = 0; i < length; ++i)
+    {
+        if (row == 0) setStepEnabled(i + length, getStepEnabled(i));
+        else setLaneValue(row, i + length, getLaneValue(row, i));
+        if (row == 6) setAftertouchGlide(i + length, getAftertouchGlide(i));
+        if (row >= baseLanes)
+        {
+            setOptionalGlide(row, i + length, getOptionalGlide(row, i));
+            if (getOptionalLaneType(row) == 0)
+                setCCTransitionMs(row - baseLanes, i + length,
+                    getCCTransitionMs(row - baseLanes, i));
+            if (getOptionalLaneType(row) == 3)
+                setVibratoDepth(i + length, getVibratoDepth(i));
+        }
+    }
+    setLaneLength(row, length * 2);
+    return true;
+}
+
+bool PolyrhythmMIDIProcessor::copyProgram(int source, int destination)
+{
+    if (source < 0 || destination < 0 || source >= programCount ||
+        destination >= programCount || source == destination) return false;
+    const juce::ScopedLock lock(programMutex);
+    if (source == getSelectedProgram()) captureCurrentProgram(savedPrograms[static_cast<size_t>(source)]);
+    const auto& from = savedPrograms[static_cast<size_t>(source)];
+    juce::MemoryBlock replacement = from.isEmpty() ? factoryProgram : from;
+    if (replacement.isEmpty()) return false;
+    if (destination == getSelectedProgram())
+    {
+        if (!restoreProgramSnapshot(replacement, destination)) return false;
+        requestMidiPanic(); requestSequenceReset();
+    }
+    savedPrograms[static_cast<size_t>(destination)] = std::move(replacement);
+    return true;
+}
+
+bool PolyrhythmMIDIProcessor::resetProgram(int index)
+{
+    if (index < 0 || index >= programCount || factoryProgram.isEmpty()) return false;
+    const juce::ScopedLock lock(programMutex);
+    if (index == getSelectedProgram())
+    {
+        if (!restoreProgramSnapshot(factoryProgram, index)) return false;
+        requestMidiPanic(); requestSequenceReset();
+    }
+    savedPrograms[static_cast<size_t>(index)] = factoryProgram;
+    return true;
+}
+
+int PolyrhythmMIDIProcessor::getSelectedProgram() const noexcept
+{
+    return activeProgram.load(std::memory_order_relaxed);
+}
+
+void PolyrhythmMIDIProcessor::selectProgram(int index)
+{
+    index = juce::jlimit(0, programCount - 1, index);
+    // A human selection takes control away from the automatic PROGRAM lane.
+    // This is the root cause of v0.6.15-18 click-backs: earlier code only
+    // discarded pending requests, but the NEXT trigger re-selected a scene.
+    setProgramLaneAutoArmed(false);
+    manualProgramEpoch.fetch_add(1, std::memory_order_acq_rel);
+    pendingSequencedProgram.store(0, std::memory_order_release);
+    if (auto* manager = juce::MessageManager::getInstanceWithoutCreating())
+        if (manager->isThisTheMessageThread())
+        {
+            applyPendingProgramChange(index);
+            const int committed = getSelectedProgram();
+            observedHostProgram = committed;
+            if (juce::roundToInt(parameters.getRawParameterValue("pn_program_slot")->load()) != committed)
+                pnordeSetAutomatable(parameters, "pn_program_slot", committed);
+        }
+}
+
+void PolyrhythmMIDIProcessor::timerCallback()
+{
+    const auto request = pendingSequencedProgram.exchange(0, std::memory_order_acq_rel);
+    int queuedIndex = -1;
+    if (PnordeProgramRequests::unpack(request,
+          manualProgramEpoch.load(std::memory_order_acquire), queuedIndex))
+    {
+        // Programme lane is an explicit destination command. Keep the VST3
+        // parameter in sync exactly once for Ableton/hardware visibility.
+        if (getProgramLaneEnabled() && getProgramLaneAutoArmed())
+            applyPendingProgramChange(queuedIndex);
+        // A PROGRAM-lane trigger is only a request. Publish the committed
+        // destination AFTER state restoration; this avoids a stale-parameter echo.
+        const int committed = getSelectedProgram();
+        observedHostProgram = committed;
+        if (juce::roundToInt(parameters.getRawParameterValue("pn_program_slot")->load()) != committed)
+            pnordeSetAutomatable(parameters, "pn_program_slot", committed);
+        return;
+    }
+    const int hostIndex = juce::jlimit(0, programCount - 1,
+        juce::roundToInt(parameters.getRawParameterValue("pn_program_slot")
+            ->load(std::memory_order_acquire)));
+    if (hostIndex != observedHostProgram)
+    {
+        // A genuine Live automation/MIDI-mapped manual command overrides AUTO.
+        setProgramLaneAutoArmed(false);
+        applyPendingProgramChange(hostIndex);
+        observedHostProgram = getSelectedProgram();
+        // If a bad program was rejected, restore the host-visible selection.
+        if (observedHostProgram != hostIndex)
+            pnordeSetAutomatable(parameters, "pn_program_slot", observedHostProgram);
+    }
+}
+
+void PolyrhythmMIDIProcessor::applyPendingProgramChange(int selected)
+{
+    selected = juce::jlimit(0, programCount - 1, selected);
+    const int previous = activeProgram.load(std::memory_order_acquire);
+    if (selected == previous) return;
+
+    const juce::ScopedLock lock(programMutex);
+    if (selected == activeProgram.load(std::memory_order_acquire)) return;
+    juce::MemoryBlock current;
+    captureCurrentProgram(current);
+    savedPrograms[static_cast<size_t>(previous)] = std::move(current);
+    if (savedPrograms[static_cast<size_t>(selected)].isEmpty())
+        savedPrograms[static_cast<size_t>(selected)] = savedPrograms[static_cast<size_t>(previous)];
+
+    if (!restoreProgramSnapshot(savedPrograms[static_cast<size_t>(selected)], selected))
+    {
+        // Failed states cannot advance the selection. Preserve the bank and
+        // recover previous music, then restore host-visible selection.
+        (void) restoreProgramSnapshot(savedPrograms[static_cast<size_t>(previous)], previous);
+        observedHostProgram = previous;
+        return;
+    }
+    activeProgram.store(selected, std::memory_order_release);
+    // Do not notify Ableton AGAIN after scene load: repeated notifications
+    // during parameter replacement were causing value echo/reversion.
+    requestMidiPanic();
+    requestSequenceReset();
+}
+
+void PolyrhythmMIDIProcessor::getStateInformation(juce::MemoryBlock& destData)
+{
+    const juce::ScopedLock lock(programMutex);
+    juce::MemoryBlock current;
+    captureCurrentProgram(current);
+    savedPrograms[static_cast<size_t>(getSelectedProgram())] = current;
+    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(current.getData(),
+        static_cast<int>(current.getSize())));
+    if (xml == nullptr) { destData = current; return; }
+    xml->setAttribute("PnordeProgramSelected", getSelectedProgram());
+    xml->setAttribute("PnordeProgramLaneEnabled", getProgramLaneEnabled() ? 1 : 0);
+    xml->setAttribute("PnordeProgramLaneAutoArmed", getProgramLaneAutoArmed() ? 1 : 0);
+    xml->setAttribute("PnordeProgramLaneLength", getProgramLaneLength());
+    xml->setAttribute("PnordeProgramLaneDivision", getProgramLaneDivision());
+    xml->setAttribute("PnordeProgramLaneTiming", getProgramLaneTiming());
+    xml->setAttribute("PnordeProgramLaneStart", getProgramLaneStart());
+    juce::String programSteps;
+    for (int n = 0; n < maxSteps; ++n)
+    {
+        if (n) programSteps += ",";
+        programSteps += juce::String(getProgramLaneValue(n));
+    }
+    xml->setAttribute("PnordeProgramLaneValues", programSteps);
+    for (int i = 0; i < programCount; ++i)
+    {
+        auto& saved = savedPrograms[static_cast<size_t>(i)];
+        if (saved.isEmpty()) saved = current; // all four scenes always persist
+        xml->setAttribute("PnordeProgramSlot" + juce::String(i), saved.toBase64Encoding());
+    }
+    copyXmlToBinary(*xml, destData);
+}
+
 namespace
 {
 // Preflight untrusted state BEFORE JUCE's XML parser is invoked. Reject XML
@@ -1311,7 +2013,7 @@ namespace
 // PNORDE generates a shallow, predictable state tree.
 bool pnordeStateEnvelopeIsSafe(const void* data, int size) noexcept
 {
-    if (data == nullptr || size < 16 || size > 1024 * 1024) return false;
+    if (data == nullptr || size < 16 || size > 4 * 1024 * 1024) return false;
     const auto* bytes = static_cast<const unsigned char*>(data);
     int tagCount = 0, depth = 0;
     for (int i = 0; i + 1 < size; ++i)
@@ -1321,7 +2023,7 @@ bool pnordeStateEnvelopeIsSafe(const void* data, int size) noexcept
         if (next == '!') return false; // DTD, ENTITY, CDATA, comments
         if (next == '?') continue; // ordinary XML declaration
         const bool closing = next == '/';
-        if (++tagCount > 256) return false;
+        if (++tagCount > 400) return false;
         if (closing)
         {
             if (--depth < 0) return false;
@@ -1345,12 +2047,21 @@ bool pnordeStateEnvelopeIsSafe(const void* data, int size) noexcept
 
 bool pnordeStateTreeIsSafe(const juce::ValueTree& state)
 {
-    if (!state.isValid() || state.getNumChildren() > 32 || state.getNumProperties() > 256)
+    // Each of the 21 lanes has its own saved properties and 14 optional
+    // lanes have additional glide/CC arrays. Their legitimate combined count
+    // exceeds 256: the v0.6.13 ceiling silently rejected real user projects.
+    // 512 remains a hard bound; every property is checked individually below.
+    if (!state.isValid() || state.getNumChildren() > 160 || state.getNumProperties() > 512)
         return false;
     for (int p = 0; p < state.getNumProperties(); ++p)
     {
-        if (state.getPropertyName(p).toString().length() > 96 ||
-            state.getProperty(state.getPropertyName(p)).toString().length() > 8192)
+        const auto name = state.getPropertyName(p).toString();
+        const bool programBlob = name.startsWith("PnordeProgramSlot") &&
+            name.length() == 18 && name.getLastCharacter() >= '0' &&
+            name.getLastCharacter() <= '3';
+        if (name.length() > 96 ||
+            state.getProperty(state.getPropertyName(p)).toString().length() >
+                (programBlob ? 524288 : 8192))
             return false;
     }
     for (int i = 0; i < state.getNumChildren(); ++i)
@@ -1376,6 +2087,9 @@ void PolyrhythmMIDIProcessor::setStateInformation(const void* data, int sizeInBy
 
 bool PolyrhythmMIDIProcessor::loadValidatedState(const void* data, int sizeInBytes)
 {
+    // Don't partially apply rejected host states. Hosts may invoke this while
+    // loading old projects; complete PNORDE snapshots must pass the bounded
+    // structural checks, including the optional-lane arrays.
     if (!pnordeStateEnvelopeIsSafe(data, sizeInBytes)) return false;
     std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
     if (xml == nullptr || !xml->hasTagName(parameters.state.getType()))
@@ -1393,6 +2107,23 @@ bool PolyrhythmMIDIProcessor::loadValidatedState(const void* data, int sizeInByt
     for (int step = 0; step < 256; ++step)
         if (requiredPattern[step] != '0' && requiredPattern[step] != '1')
             return false;
+    // A missing marker identifies v0.6.6 and earlier. A partial/future schema
+    // is refused rather than risking unpredictable restoration.
+    const bool hasSchema = state.hasProperty("PnordeStateSchema");
+    const bool hasBuild = state.hasProperty("PnordeSavedBuild");
+    if (hasSchema != hasBuild) return false;
+    if (hasSchema)
+    {
+        const auto schemaText = state.getProperty("PnordeStateSchema").toString();
+        const auto buildText = state.getProperty("PnordeSavedBuild").toString();
+        if (!schemaText.containsOnly("0123456789") ||
+            !buildText.containsOnly("0123456789") ||
+            schemaText.getIntValue() < 1 ||
+            schemaText.getIntValue() > PnordeProjectVersion::schema ||
+            buildText.getIntValue() < 1 ||
+            buildText.getIntValue() > PnordeProjectVersion::build)
+            return false;
+    }
     const int stateVersion = static_cast<int>(state.getProperty("NovaLaneDataVersion"));
     if (stateVersion < 1 || stateVersion > 16) return false;
     // Version 7 introduced the complete 21-lane format; all lanes must be
@@ -1472,8 +2203,195 @@ bool PolyrhythmMIDIProcessor::loadValidatedState(const void* data, int sizeInByt
             if (text.isEmpty() || text.containsAnyOf(".abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") ||
                 text.getIntValue() < 0 || text.getIntValue() > 100) return false;
     }
+    // Prevent unexpectedly large or malformed label payloads in a saved state.
+    for (int row = 0; row < laneCount; ++row)
+        if (state.getProperty("PnordeLaneName" + juce::String(row), "")
+                .toString().length() > 64)
+            return false;
+    // Validate new v0.6.11+ start fields before ANY live parameter writes.
+    for (int row = 0; row < laneCount; ++row)
+    {
+        const auto prop = "PnordeLaneStart" + juce::String(row);
+        if (!state.hasProperty(prop)) continue;
+        const auto startText = state.getProperty(prop).toString();
+        if (startText.isEmpty() || !startText.containsOnly("0123456789") ||
+            startText.getIntValue() < 0 || startText.getIntValue() >= maxSteps)
+            return false;
+    }
+    // v0.6.15 bank migration: old/unversioned files become Program 1.
+    // Each bank snapshot must be a complete, bounded legacy-format tree.
+    // Do this BEFORE writing any live values, so corrupt banks can't erase
+    // otherwise recoverable material. No nested banks are accepted.
+    std::array<juce::MemoryBlock, programCount> restoredPrograms;
+    const bool isBanked = state.hasProperty("PnordeProgramSelected");
+    int restoredSelection = 0;
+    if (!applyingProgramSnapshot && isBanked)
+    {
+        const auto indexText = state.getProperty("PnordeProgramSelected").toString();
+        if (!indexText.containsOnly("0123456789")) return false;
+        restoredSelection = indexText.getIntValue();
+        if (restoredSelection < 0 || restoredSelection >= programCount) return false;
+        for (int i = 0; i < programCount; ++i)
+        {
+            const auto name = "PnordeProgramSlot" + juce::String(i);
+            if (!state.hasProperty(name) ||
+                !restoredPrograms[static_cast<size_t>(i)].fromBase64Encoding(
+                    state.getProperty(name).toString())) return false;
+            const auto& slot = restoredPrograms[static_cast<size_t>(i)];
+            if (slot.getSize() > 1024 * 1024 ||
+                !pnordeStateEnvelopeIsSafe(slot.getData(), static_cast<int>(slot.getSize())))
+                return false;
+            std::unique_ptr<juce::XmlElement> slotXml(getXmlFromBinary(
+                slot.getData(), static_cast<int>(slot.getSize())));
+            if (!slotXml || !slotXml->hasTagName(parameters.state.getType())) return false;
+            const auto slotTree = juce::ValueTree::fromXml(*slotXml);
+            if (!pnordeStateTreeIsSafe(slotTree) ||
+                !slotTree.hasProperty("NovaPattern") ||
+                slotTree.getProperty("NovaPattern").toString().length() != 256 ||
+                !slotTree.hasProperty("NovaLaneDataVersion") ||
+                slotTree.hasProperty("PnordeProgramSelected")) return false;
+        }
+    }
+    // Visibility and AUTO/MANUAL state are GLOBAL; musical trigger cells
+    // belong to each of the four program snapshots.
+    const auto armText = state.getProperty("PnordeProgramLaneAutoArmed", "0").toString();
+    if (!applyingProgramSnapshot && armText != "0" && armText != "1") return false;
+    // Dedicated PROGRAM lane is global and optional for all historical states.
+    // Validate fully before changing ANY live values. Missing means OFF.
+    std::array<int, maxSteps> restoredProgramSteps {};
+    bool restoredProgramEnabled = false;
+    int restoredProgramLength = 16, restoredProgramDivision = 2;
+    int restoredProgramTiming = 0, restoredProgramStart = 0;
+    const bool haveProgramLaneData = state.hasProperty("PnordeProgramLaneValues");
+    if (haveProgramLaneData)
+    {
+        const auto parts = juce::StringArray::fromTokens(
+            state.getProperty("PnordeProgramLaneValues").toString(), ",", "");
+        if (parts.size() != maxSteps) return false;
+        for (int i = 0; i < maxSteps; ++i)
+        {
+            if (parts[i].length() != 1 || !parts[i].containsOnly("01234")) return false;
+            restoredProgramSteps[static_cast<size_t>(i)] = parts[i].getIntValue();
+        }
+        const auto safeInt = [&](const char* key, int minimum, int maximum, int& target)
+        {
+            const auto s = state.getProperty(key, "").toString();
+            if (s.isEmpty() || !s.containsOnly("0123456789")) return false;
+            target = s.getIntValue();
+            return target >= minimum && target <= maximum;
+        };
+        // Old v0.6.16/17 banks had an always-visible PROGRAM lane. Keep it
+        // visible if they contain triggers, but keep an empty lane optional.
+        bool anyTriggers = false;
+        for (int target : restoredProgramSteps) anyTriggers = anyTriggers || target != 0;
+        if (!applyingProgramSnapshot)
+        {
+            if (state.hasProperty("PnordeProgramLaneEnabled"))
+            {
+                const auto raw = state.getProperty("PnordeProgramLaneEnabled").toString();
+                if (raw != "0" && raw != "1") return false;
+                restoredProgramEnabled = raw == "1";
+            }
+            else restoredProgramEnabled = anyTriggers;
+        }
+        if (!safeInt("PnordeProgramLaneLength", 1, maxSteps, restoredProgramLength) ||
+            !safeInt("PnordeProgramLaneDivision", 0, 10, restoredProgramDivision) ||
+            !safeInt("PnordeProgramLaneTiming", 0, 2, restoredProgramTiming) ||
+            !safeInt("PnordeProgramLaneStart", 0, restoredProgramLength - 1, restoredProgramStart))
+            return false;
+    }
+    // Migrate v0.6.15-18 banks: those versions saved the PROGRAM lane once
+    // at bank level, not within each scene. Seed any missing scene lane data
+    // with that old common lane. After switching/editing, each scene can
+    // evolve its trigger sequence independently without losing the old one.
+    if (!applyingProgramSnapshot && isBanked && haveProgramLaneData)
+    {
+        for (auto& oldScene : restoredPrograms)
+        {
+            std::unique_ptr<juce::XmlElement> oldXml(getXmlFromBinary(
+                oldScene.getData(), static_cast<int>(oldScene.getSize())));
+            if (!oldXml) return false;
+            auto oldTree = juce::ValueTree::fromXml(*oldXml);
+            if (!oldTree.isValid()) return false;
+            if (oldTree.hasProperty("PnordeProgramLaneValues")) continue;
+            for (const char* key : {"PnordeProgramLaneLength", "PnordeProgramLaneDivision",
+                                    "PnordeProgramLaneTiming", "PnordeProgramLaneStart",
+                                    "PnordeProgramLaneValues"})
+                oldTree.setProperty(key, state.getProperty(key), nullptr);
+            juce::MemoryBlock migrated;
+            if (auto migratedXml = std::unique_ptr<juce::XmlElement>(oldTree.createXml()))
+                copyXmlToBinary(*migratedXml, migrated);
+            if (migrated.isEmpty() || migrated.getSize() > 1024 * 1024) return false;
+            oldScene = std::move(migrated);
+        }
+    }
+    if (!applyingProgramSnapshot)
+    {
+        // Snapshot of the selected program without banking metadata.
+        auto plain = state.createCopy();
+        plain.removeProperty("PnordeProgramSelected", nullptr);
+        for (int i = 0; i < programCount; ++i)
+            plain.removeProperty("PnordeProgramSlot" + juce::String(i), nullptr);
+        for (const char* property : {"PnordeProgramLaneEnabled", "PnordeProgramLaneAutoArmed"})
+            plain.removeProperty(property, nullptr);
+        juce::MemoryBlock legacySnapshot;
+        if (auto xmlCopy = std::unique_ptr<juce::XmlElement>(plain.createXml()))
+            copyXmlToBinary(*xmlCopy, legacySnapshot);
+        const juce::ScopedLock lock(programMutex);
+        if (isBanked) savedPrograms = std::move(restoredPrograms);
+        else
+        {
+            // v0.6.14 and earlier: preserve everything as Program 1.
+            for (auto& slot : savedPrograms) slot = legacySnapshot;
+        }
+        activeProgram.store(restoredSelection, std::memory_order_relaxed);
+        setProgramLaneEnabled(restoredProgramEnabled);
+        // AUTO is opt-in when migrating older states that lack this flag;
+        // old triggers remain intact but cannot silently fight manual clicks.
+        setProgramLaneAutoArmed(armText == "1");
+        programLaneRestartRequested.store(true, std::memory_order_release);
+        programLaneCurrent.store(-1, std::memory_order_relaxed);
+        pendingSequencedProgram.store(0, std::memory_order_relaxed);
+        state = plain;
+    }
+    if (haveProgramLaneData)
+    {
+        setProgramLaneLength(restoredProgramLength);
+        setProgramLaneDivision(restoredProgramDivision);
+        setProgramLaneTiming(restoredProgramTiming);
+        setProgramLaneStart(restoredProgramStart);
+        for (int i = 0; i < maxSteps; ++i)
+            setProgramLaneValue(i, restoredProgramSteps[static_cast<size_t>(i)]);
+        programLaneRestartRequested.store(true, std::memory_order_release);
+    }
+    // Program selection is a live host control, NEVER a per-scene parameter.
+    // Otherwise loading a scene can revert the selection on the next timer tick.
+    const int pinnedProgram = applyingProgramSnapshot
+        ? juce::jlimit(0, programCount - 1, snapshotTargetProgram)
+        : restoredSelection;
+    state.setProperty("pn_program_slot", pinnedProgram, nullptr);
     // All validation happens before modifying any live sequencer parameters.
     parameters.replaceState(state);
+    if (!applyingProgramSnapshot)
+    {
+        pnordeSetAutomatable(parameters, "pn_program_slot", restoredSelection);
+        observedHostProgram = restoredSelection;
+        manualProgramEpoch.fetch_add(1, std::memory_order_acq_rel);
+        requestMidiPanic();
+        requestSequenceReset();
+    }
+    // The append-only global-reverse parameter does not exist in pre-v0.6.13
+    // states; old sessions must always return to their original forward default.
+    // Only truly historical projects lacking this host parameter default OFF.
+    // APVTS serialises "pn_global_reverse" under its PARAM child (`id`), not
+    // as a property of the PARAMETERS root. Checking hasProperty() here
+    // previously forced OFF after EVERY quick-program restore.
+    if (!pnordeSavedParameterExists(state, "pn_global_reverse"))
+        setGlobalReverse(false);
+    for (int row = 0; row < laneCount; ++row)
+    {
+        setLaneName(row, state.getProperty("PnordeLaneName" + juce::String(row), "").toString());
+    }
 
     setSequenceLength(
         static_cast<int>(state.getProperty(
@@ -1494,8 +2412,17 @@ bool PolyrhythmMIDIProcessor::loadValidatedState(const void* data, int sizeInByt
     setAnimationsEnabled(static_cast<bool>(state.getProperty("PnordeAnimations", true)));
     setScrollFadesEnabled(static_cast<bool>(state.getProperty("PnordeScrollFades", true)));
     setTooltipsEnabled(static_cast<bool>(state.getProperty("PnordeTooltips", true)));
-    setExperimentalLightsEnabled(static_cast<bool>(state.getProperty("PnordeExperimentalLights", false)));
+    setExperimentalLightsEnabled(static_cast<bool>(state.getProperty("PnordeExperimentalLights", true)));
     setExperimentalReorderEnabled(static_cast<bool>(state.getProperty("PnordeExperimentalReorder", false)));
+    lowPitchAnchor.store(static_cast<bool>(state.getProperty("PnordePitchAnchorLow",false)),std::memory_order_relaxed);
+    setPsychedelicEnabled(static_cast<bool>(state.getProperty("PnordePsychedelicEnabled",false)));
+    setPsychedelicIntensity(static_cast<int>(state.getProperty("PnordePsychedelicIntensity",20)));
+    setVibesBleed(static_cast<int>(state.getProperty("PnordeVibesBleed",25)));
+    setVibesMode(static_cast<int>(state.getProperty("PnordeVibesMode",4)));
+    setHppdFps(static_cast<int>(state.getProperty("PnordeHppdFps",12)));
+    setHypnosis(static_cast<int>(state.getProperty("PnordeHypnosis",100)));
+    setVisualGlowEnabled(static_cast<bool>(state.getProperty("PnordeVisualGlowEnabled", true)));
+    setLaneDirection(0,static_cast<int>(state.getProperty("NovaLane0Direction",0)));
     // v0.5.8 had no micro-mode switch. Preserve the old combined
     // Slide + EDO playback behaviour on those saved projects only.
     const int savedMicroMode = state.hasProperty("PnordeMicroMode")
@@ -1529,9 +2456,21 @@ bool PolyrhythmMIDIProcessor::loadValidatedState(const void* data, int sizeInByt
         setManualTempoEnabled(false);
         setManualTempoBpm(120.0);
     }
-    setGlobalOctave(static_cast<int>(state.getProperty("PnordeGlobalOctave", 0)));
+    if (static_cast<bool>(state.getProperty("PnordeOctaveV2Used",false)))
+        setGlobalOctave(static_cast<int>(state.getProperty("PnordeGlobalOctave",0)));
+    else
+    {
+        pnordeSetAutomatable(parameters,"pn_octave_v2_active",0);
+        pnordeSetAutomatable(parameters,"pn_octave",juce::jlimit(-2,2,
+            static_cast<int>(state.getProperty("PnordeGlobalOctave",0))));
+    }
     setKey(static_cast<int>(state.getProperty("NovaKey", 0)));
-    setScale(static_cast<int>(state.getProperty("NovaScale", 0)));
+    // An unversioned old project is intentionally restored to Free 0.1.
+    // A versioned project retains its exact saved scale; none of its source
+    // pitch steps are ever requantised by this migration.
+    const int savedScale = static_cast<int>(state.getProperty(
+        "NovaScale", PnordeProjectVersion::newInstanceMajorScale));
+    setScale(PnordeProjectVersion::restoredScale(hasSchema, savedScale));
     setGlobalClockIndex(static_cast<int>(state.getProperty("NovaGlobalClock", 2)));
     setBendRangeIndex(static_cast<int>(state.getProperty("NovaBendRange", 2)));
     setDefaultMidiChannel(static_cast<int>(state.getProperty("PnordeDefaultMidiChannel", 1)));
@@ -1585,12 +2524,20 @@ bool PolyrhythmMIDIProcessor::loadValidatedState(const void* data, int sizeInByt
                                   row == 1 ? 7 : row == 2 ? 5 : row == 3 ? 3 : 16)));
         setLaneDivision(row, static_cast<int>(state.getProperty(prefix + "Division", 2)));
         setLaneTiming(row, static_cast<int>(state.getProperty(prefix + "Timing", 0)));
+        setLaneDirection(row, static_cast<int>(state.getProperty(prefix + "Direction",0)));
         const auto values = juce::StringArray::fromTokens(
             state.getProperty(prefix + "Values").toString(), ",", "");
         if (values.size() == maxSteps)
             for (int i = 0; i < maxSteps; ++i)
                 setLaneValue(row, i, row == 1 && savedVersion < 2 ? values[i].getIntValue() * 10 : values[i].getIntValue());
     }
+
+    // Restore start markers only AFTER every saved lane length has been loaded.
+    // v0.6.10 and earlier have no PnordeLaneStart property: step 1 remains
+    // the migration default. A corrupt oversized offset is bounded safely.
+    for (int row = 0; row < laneCount; ++row)
+        setLaneStartStep(row, static_cast<int>(
+            state.getProperty("PnordeLaneStart" + juce::String(row), 0)));
 
     const juce::String patternData =
         state.getProperty("NovaPattern").toString();

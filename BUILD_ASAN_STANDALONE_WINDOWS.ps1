@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $project = $PSScriptRoot
-$build = Join-Path $project 'build-asan-v058'
+$build = Join-Path $project 'build-asan-v061'
 Write-Host 'Configuring separate PNORDE AddressSanitizer Debug Standalone...' -ForegroundColor Cyan
 # /RTC1 must not be enabled alongside MSVC AddressSanitizer.
 & cmake -S "$project" -B "$build" -G 'Visual Studio 18 2026' -A x64 `

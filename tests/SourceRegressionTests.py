@@ -86,7 +86,7 @@ check('state.setProperty("PnordeOptionalGlide"' in proc and 'PnordeAftertouchGli
       'Glide format migration is explicit')
 check('clockDials[row].setVisible(visible)' in cpp and 'timingDials[row].setVisible(visible)' in cpp and 'themeSelect.setBounds(' not in cpp,
       'Lane clock dial replaces two dropdowns and Theme is Settings-only')
-check('midiOutputSelect.setBounds(juce::roundToInt(w * 0.061f)' in cpp,
+check('footer(midiOutputSelect, 47, 138)' in cpp,
       'MIDI output relocated to left footer')
 check('columnLight = 0.018f + (i % 4)' in cpp,
       'Subtle 4-column luminance cycle without changing outlines')
@@ -111,7 +111,7 @@ check('PnordeManualTempo::advance({' in proc and 'getManualTempoBpm()' in proc,
       'Manual tempo uses a bounded opt-in BPM source')
 check('previousHostBlockEndPpq' in proc and 'manualBlockEndPpq' in proc,
       'Manual clock handles host beat discontinuities')
-check('state.setProperty("NovaLaneDataVersion", 12, nullptr);' in proc,
+check('state.setProperty("NovaLaneDataVersion", 13, nullptr);' in proc,
       'Saved-state migration version bumped')
 check('timingDials[row].drawIllumination' in cpp and
       'clockDials[row].drawIllumination' in cpp,
@@ -154,3 +154,56 @@ check('processor.getEffectiveBendRangeIndex()' in cpp and
       'bendRangeSelect.setEnabled(!processor.isMicrotonalScaleSelected());' in cpp,
       'Visible Bend Range selector follows the effective bend and disables in microtonal scales')
 print('v0.5.9 microtonal/slide source regression checks complete')
+
+# v0.6.0 candidate contracts
+check('addInt("pn_play_enabled", "PNORDE Play", 0, 1, 1);' in proc and
+      'addInt("pn_reset_counter", "PNORDE Reset Trigger", 0, 127, 0);' in proc,
+      'Play/Reset are host-automatable with stable IDs')
+check('pn_lane_direction_' in proc and 'PnordePlayback::index' in proc,
+      'Lane directions affect MIDI step lookup, not just playhead display')
+check('const auto stopIfNecessary' in proc and 'if (previousBlockWasPlaying || noteIsActive) reset();' in proc,
+      'Host stop avoids redundant pressure resets on silent blocks')
+check('PnordeFactoryPresets::presets' in cpp and 'applyFactoryPreset' in cpp,
+      'Categorised factory presets are loaded into real sequencer state')
+check('PnordePatternLibrary::pans' in cpp and 'PnordePatternLibrary::slides' in cpp,
+      'Separate bounded Pan and SLIDE recipes')
+check('class PnordeMacroNameEditor' in (root/'Source/PluginEditor.h').read_text(encoding='utf-8') and
+      'labelEditor.onDirectionMenu' in cpp,
+      'Editable Macro labels support independent right-click playback menu')
+check('vibes.paintBackground(g,' in cpp and
+      'processor.getPsychedelicEnabled()' in cpp and
+      'vibes.paintOverlay(g,' in cpp,
+      'Vibes renders only when opted in; geometry is cached and grid bleed is bounded')
+check('"PnordePitchAnchorLow"' in proc and 'getLowPitchAnchor()?48.0:60.0' in proc,
+      'C3 base pitch for new projects with legacy C4 compatibility')
+print('v0.6.0 source regression checks complete')
+
+# v0.6.1 transport and automation regression checks
+check('retainedBeatPpq = end;' in proc and
+      'const double start = retainedBeatPpq;' in proc and
+      'laneCurrentSteps[row].store(-1' not in proc.split('void PolyrhythmMIDIProcessor::processBlock(',1)[1],
+      'Pause and host stop retain musical phase and lane positions')
+check('pn_lane_restart_' in proc and 'getLanePhaseOrigin(row)' in cpp and
+      'RESTART THIS LANE (automatable)' in cpp,
+      'Independent lane restart automation and UI menu are present')
+check('pn_vibes_bleed' in proc and 'vibesBleed' in cpp,
+      'Vibes grid bleed is a host-visible automation parameter')
+check('PnordeVibes.h' in (root/'Source/PluginEditor.h').read_text(encoding='utf-8') and
+      'juce::Image frame;' in (root/'Source/PnordeVibes.h').read_text(encoding='utf-8') and
+      'std::unique_ptr<Effect> effect;' in (root/'Source/PnordeVibes.h').read_text(encoding='utf-8'),
+      'Vibes holds one bounded frame and exactly one selected effect')
+print('v0.6.1 source regression checks complete')
+
+check('class NeonNodal final : public Effect' in (root/'Source/PnordeVibes.h').read_text(encoding='utf-8') and
+      'class PhaseWeave final : public Effect' in (root/'Source/PnordeVibes.h').read_text(encoding='utf-8'),
+      'Independent Neon Nodal and Phase Weave effect classes exist')
+check('effect.reset();' in (root/'Source/PnordeVibes.h').read_text(encoding='utf-8') and
+      'frame = {};' in (root/'Source/PnordeVibes.h').read_text(encoding='utf-8'),
+      'Switching visual modes releases old effect and frame buffer')
+check('frameIntervalMs = 1000.0 / requestedFps' in cpp and
+      'nextVibesFrameMs' in cpp and
+      'vibes.update(getWidth(), getHeight(), processor)' in cpp,
+      'HPPD frame generation uses the requested 1-60 FPS without catch-up bursts')
+check('PnordeVibesMode' in proc and 'vibesMode.addItem' in cpp,
+      'Active effect mode is saved and selected in Settings')
+print('v0.6.3 visual isolation regression checks complete')

@@ -1,0 +1,18 @@
+PNORDE v0.6.11 Visual Polish Candidate
+
+Main UI changes in this candidate:
+- removed the 12-step on-screen layout option (now 16 / 8 / 4)
+- gives more room to keep 16 steps visible before paging becomes necessary
+- dark mode / darkness now defaults on, with footer slider access
+- built-in lane labels are no longer text-editable
+- built-in lane label hover text now explains the MIDI behaviour / CC context
+- add/remove page buttons have clearer green/red theme lighting
+- larger clickable LANTERNS footer credit area
+- slower Chromatic Drift / gradient motion
+- hover-brightened dial arcs
+- theme preview circle in Settings
+- per-lane start marker support: Alt+double-click a step to set that lane's cycle start
+- start marker is drawn as a small play triangle + vertical line on the step edge
+- bottom-left resize triangle added
+- popup/link text colour cleanup for theme consistency
+- darker overlay clipping adjusted around popup windows
