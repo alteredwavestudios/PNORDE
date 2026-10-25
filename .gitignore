@@ -1,0 +1,30 @@
+# Compiled objects, CMake-generated data and Visual Studio output.
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/dist/
+.vs/
+*.user
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.zip
+
+# This directory is fetched locally by scripts/Get-JUCE.ps1.
+# To INCLUDE JUCE for GitHub users, run scripts/Setup-JUCE-Submodule.ps1
+# which tracks an official upstream JUCE gitlink despite this ignore entry.
+/third_party/JUCE/
+
+# No user-specific plugin builds, crash reports or personal working files.
+*.dmp
+*.log
+*.bak
+*.tmp
+*.ps1xml
+.DS_Store
+Thumbs.db
