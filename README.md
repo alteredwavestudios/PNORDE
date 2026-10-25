@@ -51,8 +51,8 @@ development with C++**, CMake â‰¥ 3.22, Git and PowerShell.
 **Option A â€” GitHub clone (recommended):**
 
 ```powershell
-git clone --recurse-submodules https://github.com/OWNER/REPO.git
-cd REPO
+git clone --recurse-submodules https://github.com/alteredwavestudios/PNORDE.git
+cd PNORDE
 ```
 
 `OWNER/REPO` is the actual published repository URL. After the maintainer adds
@@ -144,5 +144,6 @@ Third-party components retain their own licences:
 - **Audiowide:** SIL Open Font License 1.1.
 
 See [Third-party notices](THIRD_PARTY_NOTICES.md) for details.
+
 
 
