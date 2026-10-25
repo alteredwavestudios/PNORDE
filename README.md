@@ -7,7 +7,7 @@
 
 ## â¬‡ Download PNORDE for Windows
 
-**[Download the latest compiled Windows VST3](https://github.com/YOUR_USERNAME/YOUR_REPOSITORY/releases/latest/download/PNORDE-Windows-VST3.zip)**
+**[Download the latest compiled Windows VST3](https://github.com/alteredwavestudios/PNORDE/releases/latest/download/PNORDE-Windows-VST3.zip)**
 
 This direct download becomes active when a matching ZIP asset has been uploaded
 under **GitHub â†’ Releases**. To set your own repo URL, run:
@@ -144,4 +144,5 @@ Third-party components retain their own licences:
 - **Audiowide:** SIL Open Font License 1.1.
 
 See [Third-party notices](THIRD_PARTY_NOTICES.md) for details.
+
 
